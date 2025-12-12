@@ -1,0 +1,14 @@
+[Unit]
+Description=Drone C2 ACK Forwarder
+After=network.target mosquitto.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/forwarders/ack
+ExecStart=/home/ubuntu/forwarders/ack/venv/bin/python3 ack_forwarder.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

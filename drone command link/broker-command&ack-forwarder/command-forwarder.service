@@ -1,0 +1,14 @@
+[Unit]
+Description=Drone C2 Command Forwarder
+After=network.target mosquitto.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/forwarders/command
+ExecStart=/home/ubuntu/forwarders/command/venv/bin/python3 command_forwarder.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
