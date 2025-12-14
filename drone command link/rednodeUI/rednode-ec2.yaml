@@ -1,0 +1,648 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Drone C2 Operator Dashboard - EC2 Image Builder + Node-RED + Auto-Configuration'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'drone-c2'
+    Description: 'Project name for resource naming'
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where dashboard will be deployed'
+  
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: 'Public subnet ID for dashboard instance'
+  
+  GitHubConfigUrl:
+    Type: String
+    Default: 'https://raw.githubusercontent.com/AryaMajumder/cloud-to-drone-command-pipeline/main/drone%20command%20link/node-red-command-button.conf'
+    Description: 'GitHub raw URL for Node-RED flows configuration'
+  
+  AllowedCIDR:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: 'CIDR block allowed to access dashboard (restrict in production!)'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: 'EC2 Key Pair for SSH access (optional)'
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+
+Resources:
+
+  ##############################################################################
+  # EC2 Image Builder - Base Image with Node-RED
+  ##############################################################################
+  
+  NodeREDImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: !Sub '${ProjectName}-nodered-dashboard'
+      Version: '1.0.0'
+      ParentImage: !Sub 'arn:aws:imagebuilder:${AWS::Region}:aws:image/amazon-linux-2023-x86/x.x.x'
+      Components:
+        - ComponentArn: !Sub 'arn:aws:imagebuilder:${AWS::Region}:aws:component/update-linux/x.x.x'
+        - ComponentArn: !Ref NodeREDComponent
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      Tags:
+        Project: !Ref ProjectName
+
+  NodeREDComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: !Sub '${ProjectName}-nodered-component'
+      Version: '1.0.0'
+      Platform: Linux
+      Data: |
+        name: Install Node-RED and Dependencies
+        description: Installs Node.js 20, Node-RED, and required modules
+        schemaVersion: 1.0
+        
+        phases:
+          - name: build
+            steps:
+              - name: UpdateSystem
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - yum update -y
+              
+              - name: InstallNodeJS
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+                    - yum install -y nodejs git curl jq
+                    - node --version
+                    - npm --version
+              
+              - name: InstallNodeRED
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - npm install -g --unsafe-perm node-red
+                    - which node-red
+              
+              - name: CreateNodeREDDirectory
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - mkdir -p /root/.node-red
+                    - cd /root/.node-red
+                    - npm init -y
+              
+              - name: InstallNodeREDPackages
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - cd /root/.node-red
+                    - npm install node-red-dashboard
+                    - npm install node-red-node-ui-table
+                    - npm install node-red-contrib-ui-level
+                    - npm install aws-sdk
+                    - npm install @node-red-contrib-themes/midnight-red
+              
+              - name: CreateNodeREDSettings
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      cat > /root/.node-red/settings.js << 'EOF'
+                      module.exports = {
+                          uiPort: process.env.PORT || 1880,
+                          uiHost: "0.0.0.0",
+                          
+                          httpAdminRoot: '/admin',
+                          httpNodeRoot: '/',
+                          
+                          userDir: '/root/.node-red/',
+                          flowFile: 'flows.json',
+                          
+                          functionGlobalContext: {
+                              AWS: require('aws-sdk')
+                          },
+                          
+                          editorTheme: {
+                              page: {
+                                  title: "Drone C2 Dashboard"
+                              },
+                              header: {
+                                  title: "Drone Command & Control",
+                                  image: "/absolute/path/to/header/image"
+                              },
+                              palette: {
+                                  theme: "midnight-red"
+                              }
+                          },
+                          
+                          logging: {
+                              console: {
+                                  level: "info",
+                                  metrics: false,
+                                  audit: false
+                              }
+                          }
+                      }
+                      EOF
+              
+              - name: CreateSystemdService
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      cat > /etc/systemd/system/node-red.service << 'EOF'
+                      [Unit]
+                      Description=Node-RED Drone Dashboard
+                      After=network.target
+                      
+                      [Service]
+                      Type=simple
+                      ExecStart=/usr/bin/node-red --settings /root/.node-red/settings.js
+                      Restart=always
+                      RestartSec=10
+                      User=root
+                      Environment="NODE_ENV=production"
+                      StandardOutput=journal
+                      StandardError=journal
+                      SyslogIdentifier=node-red
+                      
+                      [Install]
+                      WantedBy=multi-user.target
+                      EOF
+                    - systemctl daemon-reload
+                    - systemctl enable node-red
+              
+              - name: CreateConfigurationScript
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      cat > /usr/local/bin/configure-nodered.sh << 'EOFSCRIPT'
+                      #!/bin/bash
+                      set -e
+                      
+                      echo "====================================="
+                      echo "Configuring Node-RED Dashboard"
+                      echo "====================================="
+                      
+                      # Get configuration URL from environment or parameter
+                      GITHUB_CONFIG_URL="${GITHUB_CONFIG_URL:-https://raw.githubusercontent.com/AryaMajumder/cloud-to-drone-command-pipeline/main/drone%20command%20link/node-red-command-button.conf}"
+                      
+                      # Get region and stack name from instance metadata
+                      REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+                      INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                      
+                      # Get stack name from instance tags
+                      STACK_NAME=$(aws ec2 describe-tags \
+                        --region $REGION \
+                        --filters "Name=resource-id,Values=$INSTANCE_ID" "Name=key,Values=aws:cloudformation:stack-name" \
+                        --query 'Tags[0].Value' \
+                        --output text)
+                      
+                      echo "Region: $REGION"
+                      echo "Stack: $STACK_NAME"
+                      
+                      # Fetch CloudFormation outputs
+                      echo "Fetching CloudFormation outputs..."
+                      
+                      API_URL=$(aws cloudformation describe-stacks \
+                        --stack-name "$STACK_NAME" \
+                        --region "$REGION" \
+                        --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
+                        --output text 2>/dev/null || echo "")
+                      
+                      USER_POOL_ID=$(aws cloudformation describe-stacks \
+                        --stack-name "$STACK_NAME" \
+                        --region "$REGION" \
+                        --query 'Stacks[0].Outputs[?OutputKey==`UserPoolId`].OutputValue' \
+                        --output text 2>/dev/null || echo "")
+                      
+                      CLIENT_ID=$(aws cloudformation describe-stacks \
+                        --stack-name "$STACK_NAME" \
+                        --region "$REGION" \
+                        --query 'Stacks[0].Outputs[?OutputKey==`UserPoolClientId`].OutputValue' \
+                        --output text 2>/dev/null || echo "")
+                      
+                      COGNITO_DOMAIN=$(aws cloudformation describe-stacks \
+                        --stack-name "$STACK_NAME" \
+                        --region "$REGION" \
+                        --query 'Stacks[0].Outputs[?OutputKey==`UserPoolDomain`].OutputValue' \
+                        --output text 2>/dev/null || echo "")
+                      
+                      # Create config file
+                      cat > /root/.node-red/aws-config.json << EOF
+                      {
+                        "apiUrl": "$API_URL",
+                        "cognitoUserPoolId": "$USER_POOL_ID",
+                        "cognitoClientId": "$CLIENT_ID",
+                        "cognitoDomain": "$COGNITO_DOMAIN",
+                        "region": "$REGION"
+                      }
+                      EOF
+                      
+                      echo "AWS config written to /root/.node-red/aws-config.json"
+                      
+                      # Download Node-RED flows from GitHub
+                      echo "Downloading Node-RED flows from: $GITHUB_CONFIG_URL"
+                      
+                      if curl -f -o /root/.node-red/flows.json "$GITHUB_CONFIG_URL"; then
+                        echo "✓ Successfully downloaded flows.json"
+                      else
+                        echo "✗ Failed to download flows.json"
+                        echo "Creating default flows..."
+                        cat > /root/.node-red/flows.json << 'EOFFLOWS'
+                      [
+                        {
+                          "id": "tab1",
+                          "type": "tab",
+                          "label": "Drone Control",
+                          "disabled": false
+                        },
+                        {
+                          "id": "inject1",
+                          "type": "inject",
+                          "z": "tab1",
+                          "name": "Load Config on Start",
+                          "props": [],
+                          "repeat": "",
+                          "crontab": "",
+                          "once": true,
+                          "onceDelay": "2",
+                          "topic": "",
+                          "wires": [["load-config"]]
+                        },
+                        {
+                          "id": "load-config",
+                          "type": "function",
+                          "z": "tab1",
+                          "name": "Load AWS Config",
+                          "func": "const fs = require('fs');\nconst config = JSON.parse(fs.readFileSync('/root/.node-red/aws-config.json', 'utf8'));\nglobal.set('config', config);\nnode.warn('Config loaded: ' + JSON.stringify(config));\nreturn msg;",
+                          "outputs": 1,
+                          "wires": [[]]
+                        }
+                      ]
+                      EOFFLOWS
+                      fi
+                      
+                      # Set permissions
+                      chown -R root:root /root/.node-red
+                      
+                      # Restart Node-RED
+                      echo "Restarting Node-RED service..."
+                      systemctl restart node-red
+                      
+                      # Wait for Node-RED to start
+                      sleep 5
+                      
+                      # Check status
+                      if systemctl is-active --quiet node-red; then
+                        PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+                        echo "====================================="
+                        echo "✓ Node-RED Dashboard is running!"
+                        echo "Access at: http://$PUBLIC_IP:1880/ui"
+                        echo "Admin at: http://$PUBLIC_IP:1880/admin"
+                        echo "====================================="
+                      else
+                        echo "✗ Node-RED failed to start"
+                        journalctl -u node-red -n 50 --no-pager
+                        exit 1
+                      fi
+                      
+                      # Mark as configured
+                      touch /root/.node-red/.configured
+                      
+                      EOFSCRIPT
+                    - chmod +x /usr/local/bin/configure-nodered.sh
+              
+              - name: InstallAWSCLI
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - yum install -y aws-cli
+
+  ImageBuilderInfraConfig:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: !Sub '${ProjectName}-nodered-infra'
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      InstanceTypes:
+        - t3.small
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref ImageBuilderSecurityGroup
+      TerminateInstanceOnFailure: true
+      Tags:
+        Project: !Ref ProjectName
+
+  ImageBuilderSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-imagebuilder-sg'
+      GroupDescription: 'Security group for Image Builder'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-imagebuilder-sg'
+
+  ImageBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-imagebuilder-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ImageBuilderRole
+
+  NodeREDImagePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: !Sub '${ProjectName}-nodered-pipeline'
+      ImageRecipeArn: !Ref NodeREDImageRecipe
+      InfrastructureConfigurationArn: !Ref ImageBuilderInfraConfig
+      Status: ENABLED
+      Tags:
+        Project: !Ref ProjectName
+
+  ##############################################################################
+  # Dashboard Instance Resources
+  ##############################################################################
+  
+  DashboardSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-dashboard-sg'
+      GroupDescription: 'Security group for Node-RED dashboard'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1880
+          ToPort: 1880
+          CidrIp: !Ref AllowedCIDR
+          Description: 'Node-RED Dashboard and Admin UI'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCIDR
+          Description: 'SSH Access'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dashboard-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DashboardInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-dashboard-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: DashboardAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:InitiateAuth
+                  - cognito-idp:GetUser
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DashboardInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref DashboardInstanceRole
+
+  DashboardLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-dashboard-lt'
+      LaunchTemplateData:
+        ImageId: !GetAtt GetLatestAMI.AmiId
+        InstanceType: t3.small
+        IamInstanceProfile:
+          Arn: !GetAtt DashboardInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref DashboardSecurityGroup
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+            
+            # Export GitHub config URL for the configuration script
+            export GITHUB_CONFIG_URL="${GitHubConfigUrl}"
+            
+            # Run configuration script
+            /usr/local/bin/configure-nodered.sh > /var/log/nodered-config.log 2>&1
+            
+            # Log completion
+            echo "UserData script completed at $(date)" >> /var/log/nodered-config.log
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-dashboard'
+              - Key: Project
+                Value: !Ref ProjectName
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-dashboard-volume'
+              - Key: Project
+                Value: !Ref ProjectName
+
+  # Custom resource to get latest AMI from Image Pipeline
+  GetLatestAMIFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-get-latest-ami'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt GetLatestAMIRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          ec2 = boto3.client('ec2')
+          imagebuilder = boto3.client('imagebuilder')
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      pipeline_arn = event['ResourceProperties']['PipelineArn']
+                      
+                      # Get latest image from pipeline
+                      response = imagebuilder.list_image_pipeline_images(
+                          imagePipelineArn=pipeline_arn,
+                          maxResults=1
+                      )
+                      
+                      if response['imageSummaryList']:
+                          image_arn = response['imageSummaryList'][0]['arn']
+                          
+                          # Get AMI ID from image
+                          image_response = imagebuilder.get_image(imageBuildVersionArn=image_arn)
+                          ami_id = image_response['image']['outputResources']['amis'][0]['image']
+                          
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {'AmiId': ami_id})
+                      else:
+                          # No image built yet, use latest Amazon Linux
+                          response = ec2.describe_images(
+                              Owners=['amazon'],
+                              Filters=[
+                                  {'Name': 'name', 'Values': ['al2023-ami-*-x86_64']},
+                                  {'Name': 'state', 'Values': ['available']}
+                              ]
+                          )
+                          latest = sorted(response['Images'], key=lambda x: x['CreationDate'], reverse=True)[0]
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {'AmiId': latest['ImageId']})
+                  
+                  else:  # Delete
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  GetLatestAMIRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ImageBuilderAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - imagebuilder:ListImagePipelineImages
+                  - imagebuilder:GetImage
+                  - ec2:DescribeImages
+                Resource: '*'
+
+  GetLatestAMI:
+    Type: Custom::GetLatestAMI
+    Properties:
+      ServiceToken: !GetAtt GetLatestAMIFunction.Arn
+      PipelineArn: !GetAtt NodeREDImagePipeline.Arn
+
+  DashboardInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: 
+      - NodeREDImagePipeline
+      - GetLatestAMI
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DashboardLaunchTemplate
+        Version: !GetAtt DashboardLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dashboard'
+        - Key: Project
+          Value: !Ref ProjectName
+
+##############################################################################
+# Outputs
+##############################################################################
+
+Outputs:
+  ImagePipelineArn:
+    Description: 'Image Builder Pipeline ARN'
+    Value: !GetAtt NodeREDImagePipeline.Arn
+    Export:
+      Name: !Sub '${ProjectName}-image-pipeline-arn'
+
+  DashboardInstanceId:
+    Description: 'Dashboard EC2 Instance ID'
+    Value: !Ref DashboardInstance
+    Export:
+      Name: !Sub '${ProjectName}-dashboard-instance-id'
+
+  DashboardPublicIP:
+    Description: 'Dashboard Public IP Address'
+    Value: !GetAtt DashboardInstance.PublicIp
+
+  DashboardUrl:
+    Description: 'Node-RED Dashboard URL'
+    Value: !Sub 'http://${DashboardInstance.PublicIp}:1880/ui'
+
+  DashboardAdminUrl:
+    Description: 'Node-RED Admin URL'
+    Value: !Sub 'http://${DashboardInstance.PublicIp}:1880/admin'
+
+  SSHCommand:
+    Condition: HasKeyPair
+    Description: 'SSH command to connect to dashboard'
+    Value: !Sub 'ssh -i ${KeyPairName}.pem ec2-user@${DashboardInstance.PublicIp}'
+
+  ConfigLogCommand:
+    Description: 'Command to view configuration logs'
+    Value: !Sub 'ssh ec2-user@${DashboardInstance.PublicIp} "sudo cat /var/log/nodered-config.log"'
+
+  NodeREDStatus:
+    Description: 'Command to check Node-RED status'
+    Value: !Sub 'ssh ec2-user@${DashboardInstance.PublicIp} "sudo systemctl status node-red"'
