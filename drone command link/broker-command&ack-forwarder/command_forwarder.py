@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Command Forwarder: Cloud → Agent (via SQS)
-Polls SQS for commands from IoT Core and forwards to Mosquitto
+Command Forwarder: Cloud → Agent (Direct IoT Core Subscription)
+Subscribes to AWS IoT Core and forwards commands to Mosquitto
 """
 
 import json
 import time
 import logging
-import paho.mqtt.client as mqtt
 from forwarder_lib import ForwarderBase, ForwarderConfig
 
 logging.basicConfig(
@@ -15,84 +14,89 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
+
 class CommandForwarder(ForwarderBase):
     def __init__(self, config):
         super().__init__("command", config)
-        self.sqs_queue_url = config.sqs_queue_url
-        self.sqs_client = self.session.client('sqs')
         
     def on_mqtt_connect(self, client, userdata, flags, rc):
+        """Callback when connected to Mosquitto"""
         if rc == 0:
             self.logger.info("✓ Connected to Mosquitto")
         else:
             self.logger.error(f"Mosquitto connection failed: {rc}")
     
-    def poll_commands(self):
-        """Poll SQS for commands from IoT Core"""
+    def on_iot_command(self, topic, payload):
+        """Callback when command received from IoT Core"""
         try:
-            response = self.sqs_client.receive_message(
-                QueueUrl=self.sqs_queue_url,
-                MaxNumberOfMessages=1,
-                WaitTimeSeconds=20,  # Long polling
-                VisibilityTimeout=30
-            )
+            # Decode payload
+            if isinstance(payload, bytes):
+                payload = payload.decode('utf-8')
             
-            if 'Messages' not in response:
+            data = json.loads(payload)
+            cmd_id = data.get('cmd_id', 'unknown')
+            cmd = data.get('cmd', 'unknown')
+            drone_id = data.get('drone_id', 'unknown')
+            
+            self.logger.info(f"Command from IoT: cmd_id={cmd_id}, cmd={cmd}, drone_id={drone_id}")
+            
+            # Validate command
+            if not self._validate_command(data):
+                self.logger.error(f"Invalid command: {cmd_id}")
+                self.publish_metric('CommandValidationFailed', 1)
                 return
             
-            for message in response['Messages']:
-                try:
-                    # Parse message body
-                    body = json.loads(message['Body'])
-                    
-                    cmd_id = body.get('cmd_id', 'unknown')
-                    cmd = body.get('cmd', 'unknown')
-                    drone_id = body.get('drone_id', 'unknown')
-                    params = body.get('params', {})
-                    
-                    self.logger.info(f"Command from SQS: cmd_id={cmd_id}, cmd={cmd}, drone_id={drone_id}")
-                    
-                    # Publish to Mosquitto
-                    topic = f"drone/{drone_id}/cmd"
-                    result = self.mqtt_client.publish(topic, json.dumps(body), qos=1)
-                    
-                    if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                        self.publish_metric('CommandForwarded', 1)
-                        self.logger.info(f"✓ Forwarded to agent: {cmd_id}")
-                        
-                        # Delete message from SQS (only after successful forward)
-                        self.sqs_client.delete_message(
-                            QueueUrl=self.sqs_queue_url,
-                            ReceiptHandle=message['ReceiptHandle']
-                        )
-                        self.logger.debug(f"✓ Deleted from SQS: {cmd_id}")
-                    else:
-                        self.publish_metric('CommandForwardFailed', 1)
-                        self.logger.error(f"✗ Mosquitto publish failed: {result.rc}")
-                        # Message will become visible again after VisibilityTimeout
-                        
-                except json.JSONDecodeError as e:
-                    self.logger.error(f"Invalid JSON in SQS message: {e}")
-                    # Delete malformed message
-                    self.sqs_client.delete_message(
-                        QueueUrl=self.sqs_queue_url,
-                        ReceiptHandle=message['ReceiptHandle']
-                    )
-                except Exception as e:
-                    self.logger.error(f"Error processing message: {e}")
-                    # Leave in queue for retry
-                    
+            # Forward to Mosquitto
+            mosquitto_topic = f"drone/{drone_id}/cmd"
+            result = self.mqtt_client.publish(mosquitto_topic, json.dumps(data), qos=1)
+            
+            if result.rc == 0:  # MQTT_ERR_SUCCESS
+                self.publish_metric('CommandForwarded', 1)
+                self.logger.info(f"✓ Forwarded to agent: {cmd_id}")
+            else:
+                self.publish_metric('CommandForwardFailed', 1)
+                self.logger.error(f"✗ Mosquitto publish failed: {result.rc}")
+                
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Invalid JSON in command: {e}")
+            self.publish_metric('CommandForwardFailed', 1)
         except Exception as e:
-            self.logger.error(f"SQS poll error: {e}")
-            time.sleep(5)  # Back off on error
+            self.logger.error(f"Error processing command: {e}")
+            self.publish_metric('CommandForwardFailed', 1)
+    
+    def _validate_command(self, cmd_data):
+        """Validate command structure"""
+        required_fields = ['cmd_id', 'cmd', 'drone_id']
+        
+        for field in required_fields:
+            if field not in cmd_data:
+                self.logger.error(f"Missing required field: {field}")
+                return False
+        
+        # Check if command is for this drone
+        if cmd_data['drone_id'] != self.config.drone_id:
+            self.logger.warning(f"Command for different drone: {cmd_data['drone_id']}")
+            return False
+        
+        return True
     
     def run(self):
         self.logger.info("=" * 60)
-        self.logger.info("Command Forwarder starting...")
+        self.logger.info("Command Forwarder starting (IoT Core subscription)...")
         self.logger.info("=" * 60)
         
         try:
+            # Connect to AWS IoT Core first
+            self.logger.info("Connecting to AWS IoT Core...")
+            self.connect_iot_sigv4()
+            
+            # Subscribe to command topic
+            cmd_topic = f"drone/{self.config.drone_id}/cmd"
+            self.subscribe_to_iot(cmd_topic, self.on_iot_command, qos=1)
+            self.logger.info(f"✓ Subscribed to IoT: {cmd_topic}")
+            
             # Connect to Mosquitto
+            self.logger.info("Connecting to Mosquitto...")
             self.mqtt_client = self.connect_mosquitto(self.on_mqtt_connect, None)
             time.sleep(2)
             
@@ -102,20 +106,21 @@ class CommandForwarder(ForwarderBase):
             
             self.logger.info("=" * 60)
             self.logger.info("✓ Command Forwarder running")
-            self.logger.info(f"  Polling: {self.sqs_queue_url}")
-            self.logger.info(f"  Publishing to: Mosquitto (localhost)")
+            self.logger.info(f"  Listening on IoT: drone/{self.config.drone_id}/cmd")
+            self.logger.info(f"  Publishing to Mosquitto: localhost:{self.config.mqtt_port}")
             self.logger.info("=" * 60)
             
-            # Main polling loop
+            # Keep running
             while True:
-                self.poll_commands()
+                time.sleep(1)
                 
         except KeyboardInterrupt:
             self.logger.info("Shutting down...")
             return 0
         except Exception as e:
-            self.logger.error(f"Fatal error: {e}")
+            self.logger.error(f"Fatal error: {e}", exc_info=True)
             return 1
+
 
 if __name__ == "__main__":
     config = ForwarderConfig({
@@ -127,8 +132,7 @@ if __name__ == "__main__":
         'mqtt_port': 1883,
         'cloudwatch_namespace': 'DroneC2/Command',
         'cloudwatch_enabled': True,
-        'drone_id': 'drone_001',
-        'sqs_queue_url': 'https://sqs.us-east-1.amazonaws.com/123456789012/drone-commands-queue'
+        'drone_id': 'drone_001'
     })
     
     forwarder = CommandForwarder(config)

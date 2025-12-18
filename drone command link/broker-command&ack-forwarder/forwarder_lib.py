@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 """
-Shared library for all forwarders
-Provides common connection logic, metrics, and utilities
+Forwarder Library - SigV4 Version
+Compatible with existing GitHub forwarder structure but uses access keys
 """
 
 import json
 import logging
-import hmac
-import hashlib
+import time
 from datetime import datetime
-from awscrt import mqtt as aws_mqtt
-from awsiot import mqtt_connection_builder
+from typing import Optional, Callable
 import paho.mqtt.client as mqtt
 import boto3
+from botocore.exceptions import ClientError
+
+try:
+    from AWSIoTPythonSDK.MQTTLib import AWSIoTMQTTClient
+    SDK_AVAILABLE = True
+except ImportError:
+    SDK_AVAILABLE = False
+    print("Warning: AWSIoTPythonSDK not available, falling back to boto3")
+
 
 class ForwarderConfig:
-    """Configuration holder for forwarders"""
+    """Configuration for forwarders using SigV4"""
     
     def __init__(self, config_dict):
+        # AWS Credentials
+        self.aws_access_key_id = config_dict.get('aws_access_key_id')
+        self.aws_secret_access_key = config_dict.get('aws_secret_access_key')
+        self.aws_region = config_dict.get('aws_region', 'us-east-1')
+        
         # AWS IoT Core
         self.iot_endpoint = config_dict['iot_endpoint']
-        self.iot_cert = config_dict['iot_cert']
-        self.iot_key = config_dict['iot_key']
-        self.iot_ca = config_dict['iot_ca']
         
         # Local Mosquitto
         self.mqtt_broker = config_dict.get('mqtt_broker', 'localhost')
@@ -34,29 +43,42 @@ class ForwarderConfig:
         self.cloudwatch_namespace = config_dict.get('cloudwatch_namespace')
         self.cloudwatch_enabled = config_dict.get('cloudwatch_enabled', True)
         
-        # Signing (for telemetry)
-        self.signing_key = config_dict.get('signing_key')
-        
         # Drone ID
         self.drone_id = config_dict.get('drone_id', 'drone_001')
 
+
 class ForwarderBase:
-    """Base class for all forwarders"""
+    """Base class for forwarders using SigV4"""
     
     def __init__(self, name, config):
         self.name = name
         self.config = config
         self.mqtt_client = None
-        self.iot_connection = None
+        self.iot_client = None
         self.mqtt_connected = False
         self.iot_connected = False
         
         # Setup logging
         self.logger = logging.getLogger(name)
         
+        # Setup boto3 session for credentials
+        if config.aws_access_key_id and config.aws_secret_access_key:
+            self.session = boto3.Session(
+                aws_access_key_id=config.aws_access_key_id,
+                aws_secret_access_key=config.aws_secret_access_key,
+                region_name=config.aws_region
+            )
+        else:
+            # Use default credentials (IAM role)
+            self.session = boto3.Session(region_name=config.aws_region)
+        
         # Setup CloudWatch
         if config.cloudwatch_enabled and config.cloudwatch_namespace:
-            self.cloudwatch = boto3.client('cloudwatch', region_name='us-east-1')
+            try:
+                self.cloudwatch = self.session.client('cloudwatch')
+            except Exception as e:
+                self.logger.warning(f"CloudWatch client init failed: {e}")
+                self.cloudwatch = None
         else:
             self.cloudwatch = None
     
@@ -78,30 +100,9 @@ class ForwarderBase:
         except Exception as e:
             self.logger.error(f"CloudWatch publish failed: {e}")
     
-    def sign_message(self, payload):
-        """Sign message with HMAC (for telemetry)"""
-        if not self.config.signing_key:
-            return payload
-        
-        try:
-            signature = hmac.new(
-                self.config.signing_key.encode(),
-                payload.encode(),
-                hashlib.sha256
-            ).hexdigest()
-            
-            data = json.loads(payload)
-            data['signature'] = signature
-            data['forwarder_ts'] = datetime.utcnow().isoformat()
-            
-            return json.dumps(data)
-        except Exception as e:
-            self.logger.error(f"Signing failed: {e}")
-            return payload
-    
     def connect_mosquitto(self, on_connect_callback, on_message_callback):
         """Connect to local Mosquitto broker"""
-        client = mqtt.Client(client_id=f"{self.name}_forwarder")
+        client = mqtt.Client(client_id=f"{self.name}_forwarder_{int(time.time())}")
         
         # Set callbacks
         def wrapped_on_connect(client, userdata, flags, rc):
@@ -133,32 +134,83 @@ class ForwarderBase:
         
         return client
     
-    def connect_iot(self):
-        """Connect to AWS IoT Core"""
-        self.logger.info(f"Connecting to AWS IoT Core at {self.config.iot_endpoint}")
+    def connect_iot_sigv4(self):
+        """Connect to AWS IoT Core using SigV4 (WebSocket)"""
+        if not SDK_AVAILABLE:
+            raise Exception("AWSIoTPythonSDK not installed. Install with: pip install AWSIoTPythonSDK")
         
-        def on_connection_interrupted(connection, error, **kwargs):
-            self.iot_connected = False
-            self.logger.warning(f"IoT connection interrupted: {error}")
+        self.logger.info(f"Connecting to AWS IoT Core at {self.config.iot_endpoint} (SigV4)")
         
-        def on_connection_resumed(connection, return_code, session_present, **kwargs):
-            self.iot_connected = True
-            self.logger.info(f"IoT connection resumed: {return_code}")
+        # Get credentials
+        credentials = self.session.get_credentials()
+        if credentials is None:
+            raise Exception("No AWS credentials found")
         
-        connection = mqtt_connection_builder.mtls_from_path(
-            endpoint=self.config.iot_endpoint,
-            cert_filepath=self.config.iot_cert,
-            pri_key_filepath=self.config.iot_key,
-            ca_filepath=self.config.iot_ca,
-            client_id=f"{self.name}-forwarder",
-            clean_session=False,
-            keep_alive_secs=30,
-            on_connection_interrupted=on_connection_interrupted,
-            on_connection_resumed=on_connection_resumed
+        frozen_creds = credentials.get_frozen_credentials()
+        
+        # Create IoT client with WebSocket
+        self.iot_client = AWSIoTMQTTClient(
+            f"{self.name}_forwarder",
+            useWebsocket=True
         )
         
-        connect_future = connection.connect()
-        connect_future.result()
-        self.iot_connected = True
+        # Configure endpoint (port 443 for WebSocket)
+        self.iot_client.configureEndpoint(self.config.iot_endpoint, 443)
         
-        return connection
+        # Configure IAM credentials
+        self.iot_client.configureIAMCredentials(
+            frozen_creds.access_key,
+            frozen_creds.secret_key,
+            frozen_creds.token
+        )
+        
+        # Configure connection parameters
+        self.iot_client.configureAutoReconnectBackoffTime(1, 32, 20)
+        self.iot_client.configureOfflinePublishQueueing(-1)
+        self.iot_client.configureDrainingFrequency(2)
+        self.iot_client.configureConnectDisconnectTimeout(10)
+        self.iot_client.configureMQTTOperationTimeout(5)
+        
+        # Connect
+        if self.iot_client.connect():
+            self.iot_connected = True
+            self.logger.info("Connected to AWS IoT Core")
+        else:
+            raise Exception("Failed to connect to IoT Core")
+        
+        return self.iot_client
+    
+    def publish_to_iot(self, topic, payload, qos=1):
+        """Publish message to AWS IoT Core"""
+        if not self.iot_connected or not self.iot_client:
+            self.logger.error("Cannot publish to IoT: not connected")
+            return False
+        
+        try:
+            # Ensure payload is string
+            if isinstance(payload, dict):
+                payload = json.dumps(payload)
+            elif isinstance(payload, bytes):
+                payload = payload.decode('utf-8')
+            
+            self.iot_client.publish(topic, payload, qos)
+            self.logger.debug(f"Published to IoT: {topic}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to publish to IoT: {e}")
+            return False
+    
+    def subscribe_to_iot(self, topic, callback, qos=1):
+        """Subscribe to AWS IoT Core topic"""
+        if not self.iot_connected or not self.iot_client:
+            raise Exception("Cannot subscribe: not connected to IoT Core")
+        
+        def wrapped_callback(client, userdata, message):
+            try:
+                callback(message.topic, message.payload)
+            except Exception as e:
+                self.logger.error(f"Error in IoT callback: {e}")
+        
+        self.iot_client.subscribe(topic, qos, wrapped_callback)
+        self.logger.info(f"Subscribed to IoT topic: {topic}")
