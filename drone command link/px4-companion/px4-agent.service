@@ -10,9 +10,10 @@ RestartSec=5
 Environment=DRONE_ID=drone-01
 Environment=MQTT_HOST=127.0.0.1
 Environment=MQTT_PORT=1883
-Environment=PX4_URL=udp:127.0.0.1:14550
+Environment=PX4_URL=udp:127.0.0.1:14551
 Environment=DB_PATH=/var/lib/px4_agent/agent.db
 Environment=HEARTBEAT_TIMEOUT=10
 
 [Install]
 WantedBy=multi-user.target
+
