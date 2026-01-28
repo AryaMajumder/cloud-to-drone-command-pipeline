@@ -28,7 +28,7 @@ echo "[INFO] Installation directory: $INSTALL_DIR"
 # Configuration - UPDATE THESE VALUES
 AWS_REGION="us-east-1"
 DRONE_ID="drone_001"
-SQS_QUEUE_URL=$1 # User must provide this
+SQS_QUEUE_URL=$1  # User must provide this
 MQTT_BROKER="localhost"
 MQTT_PORT="1883"
 
