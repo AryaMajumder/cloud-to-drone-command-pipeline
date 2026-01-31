@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
 ACK Forwarder: Agent → Cloud (Enhanced with Resilience)
-
-Enhancements:
-- Message buffering when cloud unavailable
-- Exponential backoff retry
-- Connection state tracking
-- Buffer overflow handling
-- Graceful reconnection
+Uses boto3 IoT Data client (IAM role auth, no certs needed)
 """
 
 import os
@@ -15,39 +9,57 @@ import json
 import time
 import logging
 import threading
+import sys
 from collections import deque
 from datetime import datetime
 
-import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../lib'))
 
-from forwarder_lib import ForwarderBase, ForwarderConfig
 import paho.mqtt.client as mqtt
+import boto3
 
+# Setup logging
+LOG_FILE = os.path.join(os.path.dirname(__file__), 'logs', 'ack_forwarder.log')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.expanduser('~/forwarders/ack/logs/ack_forwarder.log')),
+        logging.FileHandler(LOG_FILE),
         logging.StreamHandler(sys.stdout)
     ]
 )
 
-class ResilientAckForwarder(ForwarderBase):
+class ResilientAckForwarder:
     """ACK Forwarder with broker-to-cloud resilience"""
     
-    def __init__(self, config):
-        super().__init__("ack", config)
+    def __init__(self):
+        self.logger = logging.getLogger("ack")
+        
+        # Load config from environment
+        self.iot_endpoint = os.environ.get('iot_endpoint')
+        self.aws_region = os.environ.get('aws_region', 'us-east-1')
+        self.drone_id = os.environ.get('drone_id', 'drone_001')
+        self.mqtt_broker = os.environ.get('mqtt_broker', 'localhost')
+        self.mqtt_port = int(os.environ.get('mqtt_port', '1883'))
+        
+        if not self.iot_endpoint:
+            raise ValueError("iot_endpoint not set in environment")
+        
+        # Create boto3 IoT Data client
+        self.iot_data = self._create_iot_client()
+        
+        # MQTT client
+        self.mqtt_client = None
+        self.mqtt_connected = False
         
         # Resilience components
         self.buffer = deque()
-        self.max_buffer_size = int(os.environ.get('MAX_BUFFER_SIZE', '1000'))
+        self.max_buffer_size = 1000
         self.buffer_lock = threading.Lock()
         
         # Connection state
-        self.iot_connection_healthy = False
+        self.iot_connection_healthy = True  # boto3 is always "connected"
         self.reconnect_attempts = 0
-        self.max_reconnect_delay = int(os.environ.get('MAX_RECONNECT_DELAY', '60'))
         
         # Statistics
         self.stats = {
@@ -55,22 +67,36 @@ class ResilientAckForwarder(ForwarderBase):
             'messages_forwarded': 0,
             'messages_buffered': 0,
             'messages_dropped': 0,
-            'reconnection_attempts': 0,
-            'buffer_overflows': 0
+            'reconnection_attempts': 0
         }
         
-        self.resilience_thread = None
         self.running = False
+    
+    def _create_iot_client(self):
+        """Create boto3 IoT Data client"""
+        endpoint_url = f"https://{self.iot_endpoint}"
+        self.logger.info(f"Creating IoT Data client for {endpoint_url}")
+        return boto3.client('iot-data', 
+                          region_name=self.aws_region,
+                          endpoint_url=endpoint_url)
     
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to local Mosquitto"""
         if rc == 0:
+            self.mqtt_connected = True
             self.logger.info("✓ Connected to Mosquitto")
             topic = "drone/+/cmd_ack"
             client.subscribe(topic, qos=1)
             self.logger.info(f"✓ Subscribed to {topic}")
         else:
+            self.mqtt_connected = False
             self.logger.error(f"❌ Mosquitto connection failed: rc={rc}")
+    
+    def on_disconnect(self, client, userdata, rc):
+        """Callback when disconnected from Mosquitto"""
+        self.mqtt_connected = False
+        if rc != 0:
+            self.logger.warning(f"⚠️ Unexpected disconnect from Mosquitto: rc={rc}")
     
     def on_message(self, client, userdata, msg):
         """
@@ -91,16 +117,15 @@ class ResilientAckForwarder(ForwarderBase):
             
             # Try immediate delivery if cloud connection healthy
             if self.iot_connection_healthy:
-                success = self._try_publish_to_iot(topic, payload)
+                success = self._publish_to_iot(topic, payload)
                 
                 if success:
                     self.stats['messages_forwarded'] += 1
                     self.logger.info(f"✅ ACK forwarded to cloud: {cmd_id}")
-                    self.publish_metric('AckForwarded', 1)
                     return
                 else:
                     self.iot_connection_healthy = False
-                    self.logger.warning(f"⚠️ Cloud publish failed, marking unhealthy")
+                    self.logger.warning(f"⚠️ Cloud publish failed")
             
             # Buffer the message
             self._buffer_message(topic, payload, cmd_id)
@@ -109,25 +134,30 @@ class ResilientAckForwarder(ForwarderBase):
             self.logger.error(f"❌ Invalid JSON in ACK: {e}")
         except Exception as e:
             self.logger.exception(f"❌ Error handling ACK: {e}")
-            self.publish_metric('AckForwardFailed', 1)
     
-    def _try_publish_to_iot(self, topic, payload):
+    def _publish_to_iot(self, topic, payload):
         """
-        Attempt to publish to IoT Core.
+        Publish to IoT Core using boto3.
         Returns True if successful, False if failed.
         """
         try:
-            result = self.publish_to_iot(topic, payload)
-            return result
+            self.iot_data.publish(
+                topic=topic,
+                qos=1,
+                payload=payload.encode('utf-8') if isinstance(payload, str) else payload
+            )
+            return True
         except Exception as e:
-            self.logger.error(f"❌ IoT publish exception: {e}")
+            self.logger.error(f"❌ IoT publish failed: {e}")
             return False
     
     def _buffer_message(self, topic, payload, cmd_id):
         """Add message to buffer with overflow handling"""
         with self.buffer_lock:
             if len(self.buffer) >= self.max_buffer_size:
-                self._handle_buffer_overflow(cmd_id)
+                dropped = self.buffer.popleft()
+                self.stats['messages_dropped'] += 1
+                self.logger.error(f"❌ BUFFER OVERFLOW: Dropped {dropped['cmd_id']}")
             
             self.buffer.append({
                 'topic': topic,
@@ -138,24 +168,7 @@ class ResilientAckForwarder(ForwarderBase):
             })
             
             self.stats['messages_buffered'] += 1
-            self.logger.warning(
-                f"⚠️ Buffered ACK {cmd_id} (queue size: {len(self.buffer)})"
-            )
-            self.publish_metric('AckBuffered', 1)
-    
-    def _handle_buffer_overflow(self, new_cmd_id):
-        """Handle buffer overflow by dropping oldest message"""
-        if self.buffer:
-            dropped = self.buffer.popleft()
-            self.stats['messages_dropped'] += 1
-            self.stats['buffer_overflows'] += 1
-            
-            self.logger.error(
-                f"❌ BUFFER OVERFLOW: Dropped {dropped['cmd_id']} "
-                f"to make room for {new_cmd_id}"
-            )
-            self.publish_metric('AckDropped', 1)
-            self.publish_metric('BufferOverflow', 1)
+            self.logger.warning(f"⚠️ Buffered ACK {cmd_id} (queue: {len(self.buffer)})")
     
     def _resilience_loop(self):
         """
@@ -179,54 +192,43 @@ class ResilientAckForwarder(ForwarderBase):
             except Exception as e:
                 self.logger.exception(f"❌ Error in resilience loop: {e}")
                 time.sleep(5)
-        
-        self.logger.info("🔄 Resilience loop stopped")
     
     def _attempt_reconnection(self):
-        """Attempt to reconnect to IoT Core with exponential backoff"""
-        delay = min(2 ** self.reconnect_attempts, self.max_reconnect_delay)
+        """Test IoT connection with small publish"""
+        delay = min(2 ** self.reconnect_attempts, 60)
         
-        self.logger.info(
-            f"🔌 Attempting IoT Core reconnection "
-            f"(attempt #{self.reconnect_attempts + 1}, delay={delay}s)"
-        )
+        self.logger.info(f"🔌 Testing IoT connection (attempt #{self.reconnect_attempts + 1})")
         
         try:
-            # Test connection with small publish
-            test_topic = "drone/test/forwarder_health"
+            test_topic = "drone/test/health"
             test_payload = json.dumps({
                 'forwarder': 'ack',
                 'timestamp': datetime.utcnow().isoformat(),
                 'buffer_size': len(self.buffer)
             })
             
-            success = self._try_publish_to_iot(test_topic, test_payload)
+            success = self._publish_to_iot(test_topic, test_payload)
             
             if success:
                 self.iot_connection_healthy = True
                 self.reconnect_attempts = 0
                 self.stats['reconnection_attempts'] += 1
-                
-                self.logger.info(
-                    f"✅ IoT Core connection restored! "
-                    f"Buffer has {len(self.buffer)} messages to drain"
-                )
-                self.publish_metric('ConnectionRestored', 1)
+                self.logger.info(f"✅ IoT connection restored! Buffer: {len(self.buffer)}")
             else:
                 self.reconnect_attempts += 1
-                self.logger.warning(
-                    f"⚠️ Reconnection failed, will retry in {delay}s"
-                )
                 time.sleep(delay)
         
         except Exception as e:
             self.reconnect_attempts += 1
-            self.logger.error(f"❌ Reconnection error: {e}")
+            self.logger.error(f"❌ Reconnection test failed: {e}")
             time.sleep(delay)
     
     def _drain_buffer(self):
         """Send buffered messages to cloud in FIFO order"""
         initial_size = len(self.buffer)
+        if initial_size == 0:
+            return
+            
         self.logger.info(f"🚰 Draining buffer ({initial_size} messages)...")
         
         drained = 0
@@ -237,7 +239,7 @@ class ResilientAckForwarder(ForwarderBase):
                     break
                 msg = self.buffer[0]
             
-            success = self._try_publish_to_iot(msg['topic'], msg['payload'])
+            success = self._publish_to_iot(msg['topic'], msg['payload'])
             
             if success:
                 with self.buffer_lock:
@@ -246,41 +248,25 @@ class ResilientAckForwarder(ForwarderBase):
                         drained += 1
                 
                 self.stats['messages_forwarded'] += 1
-                
-                self.logger.info(
-                    f"✅ Drained ACK {msg['cmd_id']} "
-                    f"(remaining: {len(self.buffer)})"
-                )
-                self.publish_metric('AckForwarded', 1)
+                self.logger.info(f"✅ Drained {msg['cmd_id']} ({len(self.buffer)} left)")
             
             else:
                 self.iot_connection_healthy = False
                 msg['retry_count'] += 1
                 
-                self.logger.warning(
-                    f"⚠️ Buffer drain interrupted (sent {drained}/{initial_size})"
-                )
-                
-                # Give up after 10 retries
                 if msg['retry_count'] > 10:
                     with self.buffer_lock:
                         if self.buffer and self.buffer[0] == msg:
                             self.buffer.popleft()
                             self.stats['messages_dropped'] += 1
-                    
-                    self.logger.error(
-                        f"❌ Giving up on ACK {msg['cmd_id']} after 10 retries"
-                    )
-                    self.publish_metric('AckDropped', 1)
+                    self.logger.error(f"❌ Giving up on {msg['cmd_id']} after 10 retries")
                 
                 break
             
             time.sleep(0.1)
         
         if drained > 0:
-            self.logger.info(
-                f"✅ Buffer drain complete: {drained}/{initial_size} messages sent"
-            )
+            self.logger.info(f"✅ Drained {drained}/{initial_size} messages")
     
     def _log_statistics(self):
         """Periodically log statistics"""
@@ -288,37 +274,30 @@ class ResilientAckForwarder(ForwarderBase):
             time.sleep(60)
             
             self.logger.info("=" * 60)
-            self.logger.info("📊 FORWARDER STATISTICS")
-            self.logger.info(f"  Messages received:    {self.stats['messages_received']}")
-            self.logger.info(f"  Messages forwarded:   {self.stats['messages_forwarded']}")
-            self.logger.info(f"  Messages buffered:    {self.stats['messages_buffered']}")
-            self.logger.info(f"  Messages dropped:     {self.stats['messages_dropped']}")
-            self.logger.info(f"  Buffer size:          {len(self.buffer)}")
-            self.logger.info(f"  IoT connection:       {'✅ HEALTHY' if self.iot_connection_healthy else '❌ UNHEALTHY'}")
-            self.logger.info(f"  Reconnect attempts:   {self.stats['reconnection_attempts']}")
-            self.logger.info(f"  Buffer overflows:     {self.stats['buffer_overflows']}")
+            self.logger.info("📊 STATISTICS")
+            self.logger.info(f"  Received:  {self.stats['messages_received']}")
+            self.logger.info(f"  Forwarded: {self.stats['messages_forwarded']}")
+            self.logger.info(f"  Buffered:  {self.stats['messages_buffered']}")
+            self.logger.info(f"  Dropped:   {self.stats['messages_dropped']}")
+            self.logger.info(f"  Buffer:    {len(self.buffer)}")
+            self.logger.info(f"  IoT:       {'✅' if self.iot_connection_healthy else '❌'}")
             self.logger.info("=" * 60)
-            
-            # Publish aggregate metrics
-            self.publish_metric('BufferSize', len(self.buffer), unit='Count')
-            self.publish_metric('ConnectionHealthy', 
-                              1 if self.iot_connection_healthy else 0, 
-                              unit='Count')
     
     def run(self):
         """Main run loop"""
         self.logger.info("🚀 ACK Forwarder starting with resilience...")
+        self.logger.info(f"🔌 IoT: {self.iot_endpoint}")
+        self.logger.info(f"🔌 Mosquitto: {self.mqtt_broker}:{self.mqtt_port}")
         
         try:
-            self.logger.info(f"🔌 Connecting to IoT Core: {self.config.iot_endpoint}")
+            # Connect to local MQTT
+            self.mqtt_client = mqtt.Client(client_id="ack_forwarder")
+            self.mqtt_client.on_connect = self.on_connect
+            self.mqtt_client.on_message = self.on_message
+            self.mqtt_client.on_disconnect = self.on_disconnect
             
-            # FIXED: Use connect_iot_data() which uses boto3, not connect_iot()
-            self.iot_connection = self.connect_iot_data()
-            self.iot_connection_healthy = True
-            self.logger.info("✅ IoT Core connected")
-            
-            self.logger.info(f"🔌 Connecting to Mosquitto: {self.config.mqtt_broker}:{self.config.mqtt_port}")
-            self.mqtt_client = self.connect_mosquitto(self.on_connect, self.on_message)
+            self.mqtt_client.connect(self.mqtt_broker, self.mqtt_port, keepalive=60)
+            self.mqtt_client.loop_start()
             
             time.sleep(2)
             if not self.mqtt_connected:
@@ -330,17 +309,17 @@ class ResilientAckForwarder(ForwarderBase):
             # Start background threads
             self.running = True
             
-            self.resilience_thread = threading.Thread(
+            resilience_thread = threading.Thread(
                 target=self._resilience_loop,
                 daemon=True,
-                name="resilience_loop"
+                name="resilience"
             )
-            self.resilience_thread.start()
+            resilience_thread.start()
             
             stats_thread = threading.Thread(
                 target=self._log_statistics,
                 daemon=True,
-                name="stats_logger"
+                name="stats"
             )
             stats_thread.start()
             
@@ -348,31 +327,18 @@ class ResilientAckForwarder(ForwarderBase):
             self.logger.info("✅ ACK FORWARDER RUNNING (with resilience)")
             self.logger.info("=" * 60)
             
-            try:
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                self.logger.info("👋 Shutting down (Ctrl+C)...")
-                self.running = False
-                
-                if self.resilience_thread:
-                    self.resilience_thread.join(timeout=5)
-                
-                self.logger.info("📊 FINAL STATISTICS:")
-                self.logger.info(f"  Total received:   {self.stats['messages_received']}")
-                self.logger.info(f"  Total forwarded:  {self.stats['messages_forwarded']}")
-                self.logger.info(f"  Total dropped:    {self.stats['messages_dropped']}")
-                self.logger.info(f"  Buffer remaining: {len(self.buffer)}")
-                
-                return 0
+            while True:
+                time.sleep(1)
         
+        except KeyboardInterrupt:
+            self.logger.info("👋 Shutting down...")
+            self.running = False
+            return 0
         except Exception as e:
-            self.logger.exception(f"💥 Fatal error: {e}")
+            self.logger.exception(f"💥 Fatal: {e}")
             return 1
 
 
 if __name__ == "__main__":
-    # Load configuration from environment variables
-    config = ForwarderConfig(os.environ)
-    forwarder = ResilientAckForwarder(config)
+    forwarder = ResilientAckForwarder()
     exit(forwarder.run())
