@@ -1,0 +1,124 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Minimal Command System - Code from S3'
+
+Parameters:
+  IoTEndpoint:
+    Type: String
+    Description: 'AWS IoT Core endpoint'
+  
+  CodeBucket:
+    Type: String
+    Description: 'S3 bucket containing Lambda code'
+  
+  CodeKey:
+    Type: String
+    Description: 'S3 key for Lambda zip file'
+
+Resources:
+  # ==========================================
+  # SQS Queue
+  # ==========================================
+  CommandQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: CommandQueue.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CommandDLQ.Arn
+        maxReceiveCount: 3
+
+  CommandDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: CommandDLQ.fifo
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+
+  # ==========================================
+  # Lambda Role
+  # ==========================================
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MinimalCommandPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt CommandQueue.Arn
+              - Effect: Allow
+                Action:
+                  - iot:Publish
+                Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/drone/*'
+
+  # ==========================================
+  # Lambda Function (Code from S3)
+  # ==========================================
+  CommandLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: minimal-command-system
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref CommandQueue
+          IOT_ENDPOINT: !Ref IoTEndpoint
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+
+  # ==========================================
+  # SQS Trigger
+  # ==========================================
+  SQSTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt CommandQueue.Arn
+      FunctionName: !Ref CommandLambda
+      BatchSize: 1
+      Enabled: true
+
+  # ==========================================
+  # CloudWatch Logs
+  # ==========================================
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CommandLambda}'
+      RetentionInDays: 7
+
+Outputs:
+  QueueURL:
+    Value: !Ref CommandQueue
+
+  LambdaName:
+    Value: !Ref CommandLambda
+
+  DLQUrl:
+    Value: !Ref CommandDLQ
+  
+  CodeLocation:
+    Value: !Sub 's3://${CodeBucket}/${CodeKey}'

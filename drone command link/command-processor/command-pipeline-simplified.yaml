@@ -1,0 +1,448 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Drone C2 Command Pipeline - SIMPLIFIED (No IoT Routing)'
+
+Parameters:
+  DroneIdParameter:
+    Type: String
+    Default: 'drone001'
+    Description: 'Default drone ID for testing'
+  
+  OperatorEmail:
+    Type: String
+    Description: 'Email address for the first operator user'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+Resources:
+  # =============================================
+  # 1. DynamoDB Table for Commands
+  # =============================================
+  CommandsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: DroneCommands
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: cmd_id
+          AttributeType: S
+        - AttributeName: drone_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cmd_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: DroneIdIndex
+          KeySchema:
+            - AttributeName: drone_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: DroneC2
+
+  # =============================================
+  # 2. SQS FIFO Queue (SINGLE QUEUE - NO ROUTING)
+  # =============================================
+  CommandQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: DroneCommandQueue.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      DeduplicationScope: messageGroup
+      FifoThroughputLimit: perMessageGroupId
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 300  # 5 minutes
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CommandDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: DroneC2
+
+  CommandDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: DroneCommandQueue-DLQ.fifo
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: DroneC2
+
+  # =============================================
+  # 3. Cognito User Pool for Operators
+  # =============================================
+  OperatorUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: DroneC2-OperatorPool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: false
+
+  OperatorUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref OperatorUserPool
+      ClientName: DroneC2-WebClient
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  OperatorUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'dronec2-${AWS::AccountId}'
+      UserPoolId: !Ref OperatorUserPool
+
+  # =============================================
+  # 4. API Gateway
+  # =============================================
+  DroneC2Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: DroneC2-CommandAPI
+      Description: API for sending commands to drones
+
+  ApiCommandResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DroneC2Api
+      ParentId: !GetAtt DroneC2Api.RootResourceId
+      PathPart: command
+
+  ApiCommandMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DroneC2Api
+      ResourceId: !Ref ApiCommandResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambdaFunction.Arn}/invocations'
+
+  ApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref DroneC2Api
+      ProviderARNs:
+        - !GetAtt OperatorUserPool.Arn
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiCommandMethod
+    Properties:
+      RestApiId: !Ref DroneC2Api
+      StageName: prod
+
+  # =============================================
+  # 5. Lambda Functions
+  # =============================================
+  
+  # API Lambda - Receives commands and writes to SQS FIFO
+  ApiLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ApiLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt CommandsTable.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt CommandQueue.Arn
+
+  ApiLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DroneC2-ApiLambda
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt ApiLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          COMMAND_QUEUE_URL: !Ref CommandQueue
+          COMMANDS_TABLE: !Ref CommandsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime, timezone
+
+          sqs = boto3.client('sqs')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['COMMANDS_TABLE'])
+          queue_url = os.environ['COMMAND_QUEUE_URL']
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event['body'])
+                  
+                  cmd = body.get('cmd')
+                  drone_id = body.get('drone_id')
+                  params = body.get('params', {})
+                  
+                  if not cmd or not drone_id:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Missing cmd or drone_id'})
+                      }
+                  
+                  cmd_id = f"cmd-{int(datetime.now(timezone.utc).timestamp())}-{uuid.uuid4().hex[:8]}"
+                  timestamp = datetime.now(timezone.utc).isoformat()
+                  
+                  command = {
+                      'cmd_id': cmd_id,
+                      'drone_id': drone_id,
+                      'cmd': cmd,
+                      'params': params,
+                      'timestamp': timestamp
+                  }
+                  
+                  # Save to DynamoDB
+                  table.put_item(Item={
+                      'cmd_id': cmd_id,
+                      'drone_id': drone_id,
+                      'cmd': cmd,
+                      'params': params,
+                      'status': 'QUEUED',
+                      'created_at': timestamp,
+                      'updated_at': timestamp
+                  })
+                  
+                  # Send to SQS FIFO
+                  sqs.send_message(
+                      QueueUrl=queue_url,
+                      MessageBody=json.dumps(command),
+                      MessageGroupId=drone_id,
+                      MessageDeduplicationId=cmd_id
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'cmd_id': cmd_id,
+                          'status': 'QUEUED',
+                          'message': 'Command queued successfully'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  ApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DroneC2Api}/*'
+
+  # =============================================
+  # 6. IoT Rule for ACKs ONLY (No command routing)
+  # =============================================
+  AckProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AckProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt CommandsTable.Arn
+
+  AckProcessorLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DroneC2-AckProcessorLambda
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt AckProcessorLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          COMMANDS_TABLE: !Ref CommandsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timezone
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['COMMANDS_TABLE'])
+
+          def lambda_handler(event, context):
+              try:
+                  cmd_id = event.get('cmd_id')
+                  status = event.get('status')
+                  
+                  if not cmd_id:
+                      print("No cmd_id in event")
+                      return
+                  
+                  table.update_item(
+                      Key={'cmd_id': cmd_id},
+                      UpdateExpression='SET #status = :status, updated_at = :updated_at',
+                      ExpressionAttributeNames={'#status': 'status'},
+                      ExpressionAttributeValues={
+                          ':status': status,
+                          ':updated_at': datetime.now(timezone.utc).isoformat()
+                      }
+                  )
+                  
+                  print(f"Updated command {cmd_id} to status {status}")
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+
+  IoTRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IoTRuleLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt AckProcessorLambdaFunction.Arn
+
+  CommandAckRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: drone_c2_cmd_ack_processor
+      TopicRulePayload:
+        Sql: "SELECT * FROM 'drone/+/cmd_ack'"
+        Description: 'Process command acknowledgements from drones'
+        RuleDisabled: false
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt AckProcessorLambdaFunction.Arn
+
+  AckProcessorLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AckProcessorLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !GetAtt CommandAckRule.Arn
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${DroneC2Api}.execute-api.${AWS::Region}.amazonaws.com/prod'
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref OperatorUserPool
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref OperatorUserPoolClient
+
+  UserPoolDomain:
+    Description: Cognito User Pool Domain
+    Value: !Ref OperatorUserPoolDomain
+
+  CommandsTableName:
+    Description: DynamoDB Commands Table Name
+    Value: !Ref CommandsTable
+
+  CommandQueueUrl:
+    Description: SQS Command Queue URL (Forwarder polls THIS)
+    Value: !Ref CommandQueue
+    Export:
+      Name: DroneC2-CommandQueueUrl
+
+  IoTTopicCommand:
+    Description: IoT Topic for sending commands
+    Value: 'drone/{drone_id}/cmd'
+
+  IoTTopicAck:
+    Description: IoT Topic for receiving acknowledgements
+    Value: 'drone/{drone_id}/cmd_ack'
+
+  SetupInstructions:
+    Description: Instructions for EC2 forwarder setup
+    Value: !Sub |
+      On your EC2 forwarder instance, configure to poll the FIFO queue:
+      
+      sudo vi /home/ssm-user/forwarders/forwarder.env
+      
+      Set:
+      SQS_QUEUE_URL=${CommandQueue}
+      
+      Then restart:
+      sudo systemctl restart command_forwarder
