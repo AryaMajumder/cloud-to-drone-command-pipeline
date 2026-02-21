@@ -1,344 +1,255 @@
 #!/usr/bin/env python3
 """
-ACK Forwarder: Agent → Cloud (Enhanced with Resilience)
-Uses boto3 IoT Data client (IAM role auth, no certs needed)
+ACK Forwarder: Agent → Cloud (via IoT Core)
+Subscribes to local Mosquitto and forwards ACKs to IoT Core
 """
 
-import os
 import json
 import time
 import logging
-import threading
-import sys
-from collections import deque
+import os
 from datetime import datetime
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../lib'))
-
 import paho.mqtt.client as mqtt
 import boto3
+from awscrt import io, mqtt as iot_mqtt, auth
+from awsiot import mqtt_connection_builder
 
-# Setup logging
-LOG_FILE = os.path.join(os.path.dirname(__file__), 'logs', 'ack_forwarder.log')
+# Logging setup
+LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, 'ack_forwarder.log')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout)
+        logging.StreamHandler()
     ]
 )
 
-class ResilientAckForwarder:
-    """ACK Forwarder with broker-to-cloud resilience"""
-    
-    def __init__(self):
-        self.logger = logging.getLogger("ack")
+logger = logging.getLogger("ack_forwarder")
+
+class AckForwarder:
+    def __init__(self, config):
+        self.config = config
+        self.logger = logger
         
-        # Load config from environment
-        self.iot_endpoint = os.environ.get('iot_endpoint')
-        self.aws_region = os.environ.get('aws_region', 'us-east-1')
-        self.drone_id = os.environ.get('drone_id', 'drone_001')
-        self.mqtt_broker = os.environ.get('mqtt_broker', 'localhost')
-        self.mqtt_port = int(os.environ.get('mqtt_port', '1883'))
-        
-        if not self.iot_endpoint:
-            raise ValueError("iot_endpoint not set in environment")
-        
-        # Create boto3 IoT Data client
-        self.iot_data = self._create_iot_client()
-        
-        # MQTT client
-        self.mqtt_client = None
-        self.mqtt_connected = False
-        
-        # Resilience components
-        self.buffer = deque()
-        self.max_buffer_size = 1000
-        self.buffer_lock = threading.Lock()
+        # MQTT clients
+        self.mosquitto_client = None
+        self.iot_connection = None
         
         # Connection state
-        self.iot_connection_healthy = True  # boto3 is always "connected"
-        self.reconnect_attempts = 0
+        self.mosquitto_connected = False
+        self.iot_connected = False
         
-        # Statistics
-        self.stats = {
-            'messages_received': 0,
-            'messages_forwarded': 0,
-            'messages_buffered': 0,
-            'messages_dropped': 0,
-            'reconnection_attempts': 0
-        }
-        
-        self.running = False
+        # Metrics
+        self.cloudwatch = None
+        if config.get('cloudwatch_enabled'):
+            self.cloudwatch = boto3.client(
+                'cloudwatch',
+                aws_access_key_id=config['aws_access_key_id'],
+                aws_secret_access_key=config['aws_secret_access_key'],
+                region_name=config['aws_region']
+            )
     
-    def _create_iot_client(self):
-        """Create boto3 IoT Data client"""
-        endpoint_url = f"https://{self.iot_endpoint}"
-        self.logger.info(f"Creating IoT Data client for {endpoint_url}")
-        return boto3.client('iot-data', 
-                          region_name=self.aws_region,
-                          endpoint_url=endpoint_url)
-    
-    def on_connect(self, client, userdata, flags, rc):
-        """Callback when connected to local Mosquitto"""
-        if rc == 0:
-            self.mqtt_connected = True
-            self.logger.info("✓ Connected to Mosquitto")
-            topic = "drone/+/cmd_ack"
-            client.subscribe(topic, qos=1)
-            self.logger.info(f"✓ Subscribed to {topic}")
-        else:
-            self.mqtt_connected = False
-            self.logger.error(f"❌ Mosquitto connection failed: rc={rc}")
-    
-    def on_disconnect(self, client, userdata, rc):
-        """Callback when disconnected from Mosquitto"""
-        self.mqtt_connected = False
-        if rc != 0:
-            self.logger.warning(f"⚠️ Unexpected disconnect from Mosquitto: rc={rc}")
-    
-    def on_message(self, client, userdata, msg):
-        """
-        Callback when ACK received from local Mosquitto.
-        Try immediate delivery or buffer if cloud unavailable.
-        """
-        topic = msg.topic
-        payload = msg.payload.decode('utf-8')
-        
-        self.stats['messages_received'] += 1
+    def publish_metric(self, metric_name, value):
+        """Publish metric to CloudWatch"""
+        if not self.cloudwatch:
+            return
         
         try:
-            data = json.loads(payload)
+            self.cloudwatch.put_metric_data(
+                Namespace=self.config.get('cloudwatch_namespace', 'DroneC2/ACK'),
+                MetricData=[{
+                    'MetricName': metric_name,
+                    'Value': value,
+                    'Unit': 'Count',
+                    'Timestamp': datetime.utcnow()
+                }]
+            )
+        except Exception as e:
+            self.logger.error(f"CloudWatch publish failed: {e}")
+    
+    def on_mosquitto_connect(self, client, userdata, flags, rc):
+        """Mosquitto connection callback"""
+        if rc == 0:
+            self.mosquitto_connected = True
+            topic = f"drone/{self.config['drone_id']}/cmd_ack"
+            client.subscribe(topic, qos=1)
+            self.logger.info(f"✓ Connected to Mosquitto")
+            self.logger.info(f"✓ Subscribed to {topic}")
+        else:
+            self.mosquitto_connected = False
+            self.logger.error(f"Mosquitto connection failed: {rc}")
+    
+    def on_mosquitto_disconnect(self, client, userdata, rc):
+        """Mosquitto disconnection callback"""
+        self.mosquitto_connected = False
+        if rc != 0:
+            self.logger.warning(f"Unexpected Mosquitto disconnect: {rc}")
+    
+    def on_mosquitto_message(self, client, userdata, msg):
+        """
+        Callback when ACK received from local Mosquitto
+        
+        Args:
+            msg: MQTT message from agent
+        """
+        try:
+            topic = msg.topic
+            payload_str = msg.payload.decode('utf-8')
+            data = json.loads(payload_str)
+            
+            # Extract ACK details
             cmd_id = data.get('cmd_id', 'unknown')
             status = data.get('status', 'unknown')
             
-            self.logger.info(f"📨 ACK received: cmd_id={cmd_id}, status={status}")
+            self.logger.info(f"ACK: cmd_id={cmd_id}, status={status}")
             
-            # Try immediate delivery if cloud connection healthy
-            if self.iot_connection_healthy:
-                success = self._publish_to_iot(topic, payload)
+            # Forward to IoT Core
+            if self.iot_connected:
+                future = self.iot_connection.publish(
+                    topic=topic,
+                    payload=payload_str,
+                    qos=iot_mqtt.QoS.AT_LEAST_ONCE
+                )
+                future.result()  # Wait for publish to complete
                 
-                if success:
-                    self.stats['messages_forwarded'] += 1
-                    self.logger.info(f"✅ ACK forwarded to cloud: {cmd_id}")
-                    return
-                else:
-                    self.iot_connection_healthy = False
-                    self.logger.warning(f"⚠️ Cloud publish failed")
-            
-            # Buffer the message
-            self._buffer_message(topic, payload, cmd_id)
-            
+                self.publish_metric('AckForwarded', 1)
+                self.logger.info(f"✓ ACK forwarded: {cmd_id}")
+            else:
+                self.logger.error("✗ IoT not connected, dropping ACK")
+                self.publish_metric('AckDropped', 1)
+                
         except json.JSONDecodeError as e:
-            self.logger.error(f"❌ Invalid JSON in ACK: {e}")
+            self.logger.error(f"Invalid JSON from agent: {e}")
+            self.publish_metric('InvalidAck', 1)
         except Exception as e:
-            self.logger.exception(f"❌ Error handling ACK: {e}")
+            self.logger.error(f"Error forwarding ACK: {e}")
+            self.publish_metric('AckForwardFailed', 1)
     
-    def _publish_to_iot(self, topic, payload):
-        """
-        Publish to IoT Core using boto3.
-        Returns True if successful, False if failed.
-        """
-        try:
-            self.iot_data.publish(
-                topic=topic,
-                qos=1,
-                payload=payload.encode('utf-8') if isinstance(payload, str) else payload
-            )
-            return True
-        except Exception as e:
-            self.logger.error(f"❌ IoT publish failed: {e}")
-            return False
+    def connect_mosquitto(self):
+        """Connect to local Mosquitto broker"""
+        self.logger.info(f"Connecting to Mosquitto at {self.config['mqtt_broker']}:{self.config['mqtt_port']}")
+        
+        client = mqtt.Client(client_id="ack_forwarder")
+        client.on_connect = self.on_mosquitto_connect
+        client.on_disconnect = self.on_mosquitto_disconnect
+        client.on_message = self.on_mosquitto_message
+        
+        # Set credentials if provided
+        mqtt_user = self.config.get('mqtt_user')
+        mqtt_pass = self.config.get('mqtt_pass')
+        if mqtt_user and mqtt_pass:
+            client.username_pw_set(mqtt_user, mqtt_pass)
+        
+        # Connect
+        client.connect(
+            self.config['mqtt_broker'],
+            self.config['mqtt_port'],
+            keepalive=60
+        )
+        
+        # Start background loop
+        client.loop_start()
+        
+        self.mosquitto_client = client
+        
+        # Wait for connection
+        for i in range(10):
+            if self.mosquitto_connected:
+                return True
+            time.sleep(0.5)
+        
+        return False
     
-    def _buffer_message(self, topic, payload, cmd_id):
-        """Add message to buffer with overflow handling"""
-        with self.buffer_lock:
-            if len(self.buffer) >= self.max_buffer_size:
-                dropped = self.buffer.popleft()
-                self.stats['messages_dropped'] += 1
-                self.logger.error(f"❌ BUFFER OVERFLOW: Dropped {dropped['cmd_id']}")
-            
-            self.buffer.append({
-                'topic': topic,
-                'payload': payload,
-                'cmd_id': cmd_id,
-                'buffered_at': time.time(),
-                'retry_count': 0
-            })
-            
-            self.stats['messages_buffered'] += 1
-            self.logger.warning(f"⚠️ Buffered ACK {cmd_id} (queue: {len(self.buffer)})")
+    def connect_iot(self):
+        """Connect to AWS IoT Core using AWS credentials (SigV4)"""
+        self.logger.info(f"Connecting to AWS IoT Core at {self.config['iot_endpoint']}")
+        
+        # Create event loop
+        event_loop_group = io.EventLoopGroup(1)
+        host_resolver = io.DefaultHostResolver(event_loop_group)
+        client_bootstrap = io.ClientBootstrap(event_loop_group, host_resolver)
+        
+        # Create credentials provider from access key
+        credentials_provider = auth.AwsCredentialsProvider.new_static(
+            access_key_id=self.config['aws_access_key_id'],
+            secret_access_key=self.config['aws_secret_access_key']
+        )
+        
+        # Build connection with SigV4 auth
+        self.iot_connection = mqtt_connection_builder.websockets_with_default_aws_signing(
+            endpoint=self.config['iot_endpoint'],
+            client_bootstrap=client_bootstrap,
+            region=self.config['aws_region'],
+            credentials_provider=credentials_provider,
+            client_id="ack_forwarder",
+            clean_session=True,
+            keep_alive_secs=30,
+            on_connection_interrupted=self.on_iot_interrupted,
+            on_connection_resumed=self.on_iot_resumed
+        )
+        
+        # Connect
+        connect_future = self.iot_connection.connect()
+        connect_future.result()  # Wait for connection
+        
+        self.iot_connected = True
+        self.logger.info("✓ Connected to AWS IoT Core")
+        
+        return True
     
-    def _resilience_loop(self):
-        """
-        Background thread that handles:
-        1. Connection monitoring
-        2. Reconnection with exponential backoff
-        3. Buffer draining when connection restored
-        """
-        self.logger.info("🔄 Resilience loop started")
-        
-        while self.running:
-            try:
-                if not self.iot_connection_healthy:
-                    self._attempt_reconnection()
-                
-                if self.iot_connection_healthy and self.buffer:
-                    self._drain_buffer()
-                
-                time.sleep(1)
-                
-            except Exception as e:
-                self.logger.exception(f"❌ Error in resilience loop: {e}")
-                time.sleep(5)
+    def on_iot_interrupted(self, connection, error, **kwargs):
+        """IoT connection interrupted"""
+        self.iot_connected = False
+        self.logger.warning(f"IoT connection interrupted: {error}")
     
-    def _attempt_reconnection(self):
-        """Test IoT connection with small publish"""
-        delay = min(2 ** self.reconnect_attempts, 60)
-        
-        self.logger.info(f"🔌 Testing IoT connection (attempt #{self.reconnect_attempts + 1})")
-        
-        try:
-            test_topic = "drone/test/health"
-            test_payload = json.dumps({
-                'forwarder': 'ack',
-                'timestamp': datetime.utcnow().isoformat(),
-                'buffer_size': len(self.buffer)
-            })
-            
-            success = self._publish_to_iot(test_topic, test_payload)
-            
-            if success:
-                self.iot_connection_healthy = True
-                self.reconnect_attempts = 0
-                self.stats['reconnection_attempts'] += 1
-                self.logger.info(f"✅ IoT connection restored! Buffer: {len(self.buffer)}")
-            else:
-                self.reconnect_attempts += 1
-                time.sleep(delay)
-        
-        except Exception as e:
-            self.reconnect_attempts += 1
-            self.logger.error(f"❌ Reconnection test failed: {e}")
-            time.sleep(delay)
-    
-    def _drain_buffer(self):
-        """Send buffered messages to cloud in FIFO order"""
-        initial_size = len(self.buffer)
-        if initial_size == 0:
-            return
-            
-        self.logger.info(f"🚰 Draining buffer ({initial_size} messages)...")
-        
-        drained = 0
-        
-        while self.buffer and self.iot_connection_healthy:
-            with self.buffer_lock:
-                if not self.buffer:
-                    break
-                msg = self.buffer[0]
-            
-            success = self._publish_to_iot(msg['topic'], msg['payload'])
-            
-            if success:
-                with self.buffer_lock:
-                    if self.buffer and self.buffer[0] == msg:
-                        self.buffer.popleft()
-                        drained += 1
-                
-                self.stats['messages_forwarded'] += 1
-                self.logger.info(f"✅ Drained {msg['cmd_id']} ({len(self.buffer)} left)")
-            
-            else:
-                self.iot_connection_healthy = False
-                msg['retry_count'] += 1
-                
-                if msg['retry_count'] > 10:
-                    with self.buffer_lock:
-                        if self.buffer and self.buffer[0] == msg:
-                            self.buffer.popleft()
-                            self.stats['messages_dropped'] += 1
-                    self.logger.error(f"❌ Giving up on {msg['cmd_id']} after 10 retries")
-                
-                break
-            
-            time.sleep(0.1)
-        
-        if drained > 0:
-            self.logger.info(f"✅ Drained {drained}/{initial_size} messages")
-    
-    def _log_statistics(self):
-        """Periodically log statistics"""
-        while self.running:
-            time.sleep(60)
-            
-            self.logger.info("=" * 60)
-            self.logger.info("📊 STATISTICS")
-            self.logger.info(f"  Received:  {self.stats['messages_received']}")
-            self.logger.info(f"  Forwarded: {self.stats['messages_forwarded']}")
-            self.logger.info(f"  Buffered:  {self.stats['messages_buffered']}")
-            self.logger.info(f"  Dropped:   {self.stats['messages_dropped']}")
-            self.logger.info(f"  Buffer:    {len(self.buffer)}")
-            self.logger.info(f"  IoT:       {'✅' if self.iot_connection_healthy else '❌'}")
-            self.logger.info("=" * 60)
+    def on_iot_resumed(self, connection, return_code, session_present, **kwargs):
+        """IoT connection resumed"""
+        self.iot_connected = True
+        self.logger.info(f"IoT connection resumed: {return_code}")
     
     def run(self):
         """Main run loop"""
-        self.logger.info("🚀 ACK Forwarder starting with resilience...")
-        self.logger.info(f"🔌 IoT: {self.iot_endpoint}")
-        self.logger.info(f"🔌 Mosquitto: {self.mqtt_broker}:{self.mqtt_port}")
+        self.logger.info("=" * 60)
+        self.logger.info("ACK Forwarder starting...")
+        self.logger.info("=" * 60)
         
         try:
-            # Connect to local MQTT
-            self.mqtt_client = mqtt.Client(client_id="ack_forwarder")
-            self.mqtt_client.on_connect = self.on_connect
-            self.mqtt_client.on_message = self.on_message
-            self.mqtt_client.on_disconnect = self.on_disconnect
-            
-            self.mqtt_client.connect(self.mqtt_broker, self.mqtt_port, keepalive=60)
-            self.mqtt_client.loop_start()
-            
-            time.sleep(2)
-            if not self.mqtt_connected:
-                self.logger.error("❌ Failed to connect to Mosquitto")
+            # Connect to Mosquitto
+            if not self.connect_mosquitto():
+                self.logger.error("Failed to connect to Mosquitto")
                 return 1
             
-            self.logger.info("✅ Mosquitto connected")
-            
-            # Start background threads
-            self.running = True
-            
-            resilience_thread = threading.Thread(
-                target=self._resilience_loop,
-                daemon=True,
-                name="resilience"
-            )
-            resilience_thread.start()
-            
-            stats_thread = threading.Thread(
-                target=self._log_statistics,
-                daemon=True,
-                name="stats"
-            )
-            stats_thread.start()
+            # Connect to IoT Core
+            if not self.connect_iot():
+                self.logger.error("Failed to connect to IoT Core")
+                return 1
             
             self.logger.info("=" * 60)
-            self.logger.info("✅ ACK FORWARDER RUNNING (with resilience)")
+            self.logger.info("✓ ACK Forwarder running")
+            self.logger.info(f"  Mosquitto: {self.config['mqtt_broker']}:{self.config['mqtt_port']}")
+            self.logger.info(f"  Subscribed: drone/{self.config['drone_id']}/cmd_ack")
+            self.logger.info(f"  IoT Core: {self.config['iot_endpoint']}")
             self.logger.info("=" * 60)
             
+            # Keep running
             while True:
                 time.sleep(1)
-        
+                
         except KeyboardInterrupt:
-            self.logger.info("👋 Shutting down...")
-            self.running = False
+            self.logger.info("Shutting down...")
             return 0
         except Exception as e:
-            self.logger.exception(f"💥 Fatal: {e}")
+            self.logger.error(f"Fatal error: {e}")
             return 1
-
-
-if __name__ == "__main__":
-    forwarder = ResilientAckForwarder()
-    exit(forwarder.run())
+        finally:
+            # Cleanup
+            if self.mosquitto_client:
+                self.mosquitto_client.loop_stop()
+                self.mosquitto_client.disconnect()
+            if self.iot_connection:
+                disconnect_future = self.iot_connection.disconnect()
+                disconnect_future.result()
