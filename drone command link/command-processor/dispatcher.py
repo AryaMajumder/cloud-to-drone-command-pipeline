@@ -1,6 +1,6 @@
 """
 Dispatcher - Pure boundary to transport.
-Publishes payload. Nothing more.
+Publishes payload with command_id added.
 """
 
 import json
@@ -68,18 +68,12 @@ def dispatch(command: CommandEnvelope, mqtt_adapter: MQTTAdapter) -> None:
     """
     Dispatch command to transport.
     
-    Does NOT:
-    - Understand MAVLink
-    - Modify payload
-    - Add retry logic
-    - Track execution
+    Critical fix: Adds command_id to payload before publishing.
     
-    Only:
-    - Extracts payload
-    - Publishes to MQTT
-    - Logs result
+    The command.payload contains user input (target_id, action, params)
+    but NOT the command_id which is in command.command_id.
     
-    This is the boundary between cloud and broker.
+    We must add it so the agent can track the command.
     """
     logger.info(f"Dispatching command: {command.command_id}")
     
@@ -89,8 +83,17 @@ def dispatch(command: CommandEnvelope, mqtt_adapter: MQTTAdapter) -> None:
     # Build topic (convention: drone/{target_id}/cmd)
     topic = f"drone/{target_id}/cmd"
     
-    # Publish raw payload (broker interprets, not us)
-    payload_str = json.dumps(command.payload)
+    # CRITICAL FIX: Add command_id to payload
+    # Create a copy to avoid mutating the original
+    mqtt_payload = {
+        **command.payload,  # Include all user fields (target_id, action, params)
+        'command_id': command.command_id  # Add the generated command_id
+    }
+    
+    # Publish complete payload
+    payload_str = json.dumps(mqtt_payload)
+    
+    logger.info(f"Publishing to {topic}: {payload_str}")
     
     try:
         mqtt_adapter.publish(topic, payload_str)
