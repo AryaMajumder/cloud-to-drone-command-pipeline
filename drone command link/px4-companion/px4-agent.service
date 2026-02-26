@@ -13,7 +13,7 @@ ExecStart=/opt/drone-command/venv/bin/python /opt/drone-command/px4_agent.py
 Environment=DRONE_ID=drone-01
 Environment=MQTT_HOST=127.0.0.1
 Environment=MQTT_PORT=1883
-Environment=PX4_URL=udpout:127.0.0.1:14550
+Environment=PX4_URL=udpin:127.0.0.1:14560
 Environment=DB_PATH=/var/lib/px4-agent/commands.db
 Environment=HEARTBEAT_TIMEOUT=10
 Environment=LOG_LEVEL=INFO
@@ -28,4 +28,5 @@ NoNewPrivileges=true
 PrivateTmp=true
 
 [Install]
+
 WantedBy=multi-user.target
