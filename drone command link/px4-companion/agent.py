@@ -11,6 +11,14 @@ Combines:
        dual payload format (cmd_id/command_id, drone_id/target_id, cmd/action),
        duplicate command detection, per-connection thread-safe SQLite.
 
+State model:
+  RECEIVED  — command persisted + acknowledged (replaces ACK)
+  EXECUTED  — PX4 confirmed
+  FAILED    — sent to PX4, no confirmation or PX4 rejected
+  REJECTED  — not sent to PX4 at all (replaces NACK)
+
+Rule: every state emitted is persisted first. Nothing lives only in MQTT.
+
 Supported commands: RTL, LAND, LOITER, HOLD, ARM, DISARM, TAKEOFF, SET_MODE
 Payload formats accepted:
   Legacy: {"cmd_id": "...", "drone_id": "...", "cmd": "RTL", "params": {}}
@@ -86,7 +94,9 @@ os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 db_lock = threading.Lock()
 
 def _db():
-    return sqlite3.connect(DB_PATH, timeout=10.0)
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 def _init_db():
     with db_lock:
@@ -94,12 +104,16 @@ def _init_db():
         try:
             c = conn.cursor()
             c.execute("""CREATE TABLE IF NOT EXISTS commands(
-                cmd_id     TEXT PRIMARY KEY,
-                drone_id   TEXT,
-                payload    TEXT,
-                status     TEXT,
-                created_at TEXT,
-                updated_at TEXT
+                cmd_id             TEXT PRIMARY KEY,
+                drone_id           TEXT,
+                payload            TEXT,
+                status             TEXT,
+                reason             TEXT,
+                exec_result        TEXT,
+                created_at         TEXT,
+                updated_at         TEXT,
+                cloud_confirmed    INTEGER DEFAULT 0,
+                cloud_confirmed_at TEXT
             )""")
             c.execute("""CREATE TABLE IF NOT EXISTS events(
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +124,21 @@ def _init_db():
             )""")
             c.execute("""CREATE INDEX IF NOT EXISTS idx_status
                 ON commands(status, created_at)""")
+            c.execute("""CREATE INDEX IF NOT EXISTS idx_replay
+                ON commands(status, cloud_confirmed, created_at)""")
+            conn.commit()
+
+            # safe migrations for existing DBs without new columns
+            existing = {row[1] for row in c.execute("PRAGMA table_info(commands)")}
+            for col, defn in [
+                ("reason",             "TEXT"),
+                ("exec_result",        "TEXT"),
+                ("cloud_confirmed",    "INTEGER DEFAULT 0"),
+                ("cloud_confirmed_at", "TEXT"),
+            ]:
+                if col not in existing:
+                    c.execute(f"ALTER TABLE commands ADD COLUMN {col} {defn}")
+                    log.info("DB migration: added column %s", col)
             conn.commit()
             log.info("DB initialised")
         finally:
@@ -149,14 +178,21 @@ def db_insert_command(cmd_id, drone_id, payload_json, status="RECEIVED"):
         finally:
             conn.close()
 
-def db_update_status(cmd_id, status):
+def db_update_status(cmd_id, status, reason=None, exec_result=None):
     now = datetime.utcnow().isoformat() + "Z"
     with db_lock:
         conn = _db()
         try:
             conn.execute(
-                "UPDATE commands SET status=?,updated_at=? WHERE cmd_id=?",
-                (status, now, cmd_id)
+                "UPDATE commands SET status=?, reason=?, exec_result=?, updated_at=?"
+                " WHERE cmd_id=?",
+                (
+                    status,
+                    reason,
+                    json.dumps(exec_result) if exec_result is not None else None,
+                    now,
+                    cmd_id,
+                )
             )
             conn.commit()
             log.info("DB update: %s -> %s", cmd_id, status)
@@ -481,7 +517,7 @@ def publish_ack(cmd_id, status, exec_result=None, reason=None):
     if reason:
         msg["reason"] = reason
     mqtt_client.publish(f"drone/{DRONE_ID}/cmd_ack", json.dumps(msg), qos=1)
-    log.info("Published ACK: status=%s  cmd_id=%s", status, cmd_id)
+    log.info("Published state: status=%s  cmd_id=%s", status, cmd_id)
 
 def on_connect(client, userdata, flags, rc):
     log.info("MQTT on_connect rc=%s", rc)
@@ -525,7 +561,7 @@ def on_message(client, userdata, msg):
             log.warning("Missing cmd_id or drone_id — dropping")
             return
         if drone_id != DRONE_ID:
-            log.info("Command for %s, ignoring", drone_id)
+            log.info("Command for '%s', ignoring (I am '%s')", drone_id, DRONE_ID)
             return
         if command_exists(cmd_id):
             publish_ack(cmd_id, db_get_status(cmd_id) or "DUPLICATE")
@@ -535,13 +571,18 @@ def on_message(client, userdata, msg):
                 cloud_link_ok = False
             if not cloud_link_ok:
                 log.warning("Cloud link down — rejecting %s", cmd_id)
-                publish_ack(cmd_id, "NACK", reason="link_down")
+                db_insert_command(cmd_id, DRONE_ID, j, status="REJECTED")
+                publish_ack(cmd_id, "REJECTED", reason="link_down")
+                db_log_event("WARN", "rejected_link_down", {"cmd_id": cmd_id})
                 return
 
         if not db_insert_command(cmd_id, DRONE_ID, j, status="RECEIVED"):
             return
 
-        publish_ack(cmd_id, "ACK")
+        # RECEIVED = persisted + acknowledged. Single event, single meaning.
+        publish_ack(cmd_id, "RECEIVED")
+        db_log_event("INFO", "cmd_received", {"cmd_id": cmd_id})
+
         threading.Thread(
             target=process_command, args=(j,),
             daemon=True, name=f"cmd-{cmd_id[:8]}"
@@ -549,21 +590,32 @@ def on_message(client, userdata, msg):
 
 def process_command(j):
     cmd_id = j.get("cmd_id") or j.get("command_id")
+    cmd    = (j.get("cmd") or j.get("action") or "").upper()
     log.info("Processing: %s", cmd_id)
+
+    # guard: unknown command — REJECTED, never touches PX4
+    known = {"RTL", "LOITER", "HOLD", "SET_MODE", "LAND", "ARM", "DISARM", "TAKEOFF"}
+    if cmd not in known:
+        log.warning("Unknown command '%s' — rejecting %s", cmd, cmd_id)
+        db_update_status(cmd_id, "REJECTED", reason=f"unsupported cmd: {cmd}")
+        publish_ack(cmd_id, "REJECTED", reason=f"unsupported cmd: {cmd}")
+        db_log_event("WARN", "rejected_unknown_cmd", {"cmd_id": cmd_id, "cmd": cmd})
+        return
+
     try:
         result = send_mavlink_command(j)
         if result.get("success"):
-            db_update_status(cmd_id, "EXECUTED")
+            db_update_status(cmd_id, "EXECUTED", exec_result=result)
             publish_ack(cmd_id, "EXECUTED", exec_result=result)
             db_log_event("INFO", "cmd_executed", {"cmd_id": cmd_id, "result": result})
         else:
-            db_update_status(cmd_id, "FAILED")
-            publish_ack(cmd_id, "NACK", exec_result=result, reason="send_failed")
+            db_update_status(cmd_id, "FAILED", reason="send_failed", exec_result=result)
+            publish_ack(cmd_id, "FAILED", exec_result=result, reason="send_failed")
             db_log_event("ERROR", "send_failed", {"cmd_id": cmd_id, "detail": result})
     except Exception as e:
         log.exception("Exception processing %s", cmd_id)
-        db_update_status(cmd_id, "FAILED")
-        publish_ack(cmd_id, "NACK", reason=str(e))
+        db_update_status(cmd_id, "FAILED", reason=str(e))
+        publish_ack(cmd_id, "FAILED", reason=str(e))
 
 def _cloud_hb_watcher():
     global cloud_link_ok
