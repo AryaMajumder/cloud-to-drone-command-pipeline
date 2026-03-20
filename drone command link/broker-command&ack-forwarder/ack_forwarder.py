@@ -224,7 +224,7 @@ class AckForwarder:
                 return 1
             
             # Connect to IoT Core
-            if not self.connect_iot():
+            if not self.connect_iot_boto3():
                 self.logger.error("Failed to connect to IoT Core")
                 return 1
             
