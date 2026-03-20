@@ -222,6 +222,7 @@ class AckForwarder:
             if not self.connect_mosquitto():
                 self.logger.error("Failed to connect to Mosquitto")
                 return 1
+            self.connect_iot_boto3()
             
             # Connect to IoT Core
             if not self.connect_iot_boto3():
