@@ -138,4 +138,64 @@ class ForwarderBase:
             frozen_creds.token
         )
         self.iot_client.configureAutoReconnectBackoffTime(1, 32, 20)
-        self.iot_client.configureOfflinePublish
+        self.iot_client.configureOfflinePublishQueueing(-1)
+        self.iot_client.configureDrainingFrequency(2)
+        self.iot_client.configureConnectDisconnectTimeout(10)
+        self.iot_client.configureMQTTOperationTimeout(5)
+        
+        if self.iot_client.connect():
+            self.iot_connected = True
+            self.logger.info("Connected to AWS IoT Core")
+        else:
+            raise Exception("Failed to connect to IoT Core")
+        
+        return self.iot_client
+
+    def connect_iot_boto3(self):
+        """Connect to AWS IoT Core using boto3 iot-data — no extra SDK needed"""
+        self.logger.info(f"Connecting to AWS IoT Core at {self.config.iot_endpoint} (boto3)")
+        self.iot_client = self.session.client(
+            'iot-data',
+            endpoint_url=f"https://{self.config.iot_endpoint}"
+        )
+        self.iot_connected = True
+        self.logger.info("Connected to AWS IoT Core")
+        return self.iot_client
+
+    def publish_to_iot(self, topic, payload, qos=1):
+        """Publish message to AWS IoT Core via boto3"""
+        if not self.iot_connected or not self.iot_client:
+            self.logger.error("Cannot publish to IoT: not connected")
+            return False
+        
+        try:
+            if isinstance(payload, dict):
+                payload = json.dumps(payload)
+            elif isinstance(payload, bytes):
+                payload = payload.decode('utf-8')
+            
+            self.iot_client.publish(
+                topic=topic,
+                qos=qos,
+                payload=payload
+            )
+            self.logger.debug(f"Published to IoT: {topic}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to publish to IoT: {e}")
+            return False
+    
+    def subscribe_to_iot(self, topic, callback, qos=1):
+        """Subscribe to AWS IoT Core topic"""
+        if not self.iot_connected or not self.iot_client:
+            raise Exception("Cannot subscribe: not connected to IoT Core")
+        
+        def wrapped_callback(client, userdata, message):
+            try:
+                callback(message.topic, message.payload)
+            except Exception as e:
+                self.logger.error(f"Error in IoT callback: {e}")
+        
+        self.iot_client.subscribe(topic, qos, wrapped_callback)
+        self.logger.info(f"Subscribed to IoT topic: {topic}")
