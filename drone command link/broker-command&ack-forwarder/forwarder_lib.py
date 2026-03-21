@@ -180,26 +180,30 @@ class ForwarderBase:
         
         return self.iot_client
     
+    # WITH this:
     def publish_to_iot(self, topic, payload, qos=1):
-        """Publish message to AWS IoT Core"""
-        if not self.iot_connected or not self.iot_client:
-            self.logger.error("Cannot publish to IoT: not connected")
-            return False
-        
-        try:
-            # Ensure payload is string
-            if isinstance(payload, dict):
-                payload = json.dumps(payload)
-            elif isinstance(payload, bytes):
-                payload = payload.decode('utf-8')
-            
-            self.iot_client.publish(topic, payload, qos)
-            self.logger.debug(f"Published to IoT: {topic}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to publish to IoT: {e}")
-            return False
+    """Publish message to AWS IoT Core via boto3"""
+    	if not self.iot_connected or not self.iot_client:
+        	self.logger.error("Cannot publish to IoT: not connected")
+        	return False
+
+    	try:
+        	if isinstance(payload, dict):
+            	payload = json.dumps(payload)
+        	elif isinstance(payload, bytes):
+            	payload = payload.decode('utf-8')
+
+        	self.iot_client.publish(
+            	topic=topic,
+            	qos=qos,
+            	payload=payload
+        	)
+        self.logger.debug(f"Published to IoT: {topic}")
+        return True
+
+    except Exception as e:
+        self.logger.error(f"Failed to publish to IoT: {e}")
+        return False
     
     def subscribe_to_iot(self, topic, callback, qos=1):
         """Subscribe to AWS IoT Core topic"""
