@@ -72,7 +72,7 @@ class AckForwarder:
     def on_mosquitto_connect(self, client, userdata, flags, rc):
         if rc == 0:
             self.mosquitto_connected = True
-            topic = f"drone/{self.config['drone_id']}/cmd_ack"
+            topic = "drone/+/cmd_ack"
             client.subscribe(topic, qos=1)
             self.logger.info(f"✓ Connected to Mosquitto")
             self.logger.info(f"✓ Subscribed to {topic}")
