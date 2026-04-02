@@ -1,0 +1,29 @@
+[Unit]
+Description=Drone Command State Publisher (catch-up replay to cloud)
+After=network.target px4-agent.service
+Wants=px4-agent.service
+
+[Service]
+Type=simple
+User=companion
+Group=companion
+WorkingDirectory=/opt/drone-command
+
+Environment="DRONE_ID=drone-01"
+Environment="MQTT_HOST=127.0.0.1"
+Environment="MQTT_PORT=1883"
+Environment="DB_PATH=/var/lib/px4_agent/agent.db"
+Environment="REPLAY_INTERVAL_SEC=300"
+Environment="REPLAY_N=10"
+Environment="REPLAY_TTL_HOURS=2"
+
+ExecStart=/opt/drone-command/venv/bin/python3 /opt/drone-command/state_publisher.py
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
