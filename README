@@ -1,0 +1,429 @@
+# Drone C2 Command Pipeline
+
+Cloud-to-drone command & control (C2) over AWS. Commands flow from the cloud down to a PX4 drone via AWS IoT Core, a local MQTT broker, and a companion agent. Acknowledgements travel the same path in reverse. Every state transition is durable and ordered.
+
+---
+
+## Table of Contents
+
+1. [Architecture](#architecture)
+2. [Design Philosophy](#design-philosophy)
+3. [Components](#components)
+   - [PX4 Companion Agent](#px4-companion-agent)
+   - [Local Mosquitto Broker](#local-mosquitto-broker)
+   - [IoT Forwarder](#iot-forwarder)
+   - [AWS IoT Core](#aws-iot-core)
+   - [Cloud Command Pipeline](#cloud-command-pipeline)
+   - [DynamoDB Commands Table](#dynamodb-commands-table)
+4. [Command Lifecycle](#command-lifecycle)
+5. [Implementation Status](#implementation-status)
+6. [What's Next](#whats-next)
+
+---
+
+## Architecture
+
+```
+Cloud
+│
+├── Command Producer Lambda
+│       ↓ writes cmd_id row to DynamoDB
+│       ↓ pushes to SQS FIFO (MessageGroupId=drone_id)
+│
+├── Worker Lambda
+│       ↓ consumes SQS FIFO in order
+│       ↓ publishes to IoT Core  drone/<id>/cmd  (QoS 1)
+│       ↓ marks DynamoDB: PUBLISHED_TO_IOT
+│
+├── AWS IoT Core
+│       ↓ topic: drone/<id>/cmd  ──────────────────────────────────────►
+│       ◄── topic: drone/<id>/cmd_ack ───────────────────────────────────
+│       ↓ IoT Rule on cmd_ack
+│
+└── ack_processor Lambda
+        ↓ updates DynamoDB: ACK or EXECUTED
+
+Edge
+│
+├── IoT Forwarder (EC2)
+│       ↓ subscribes IoT Core drone/<id>/cmd  → publishes local Mosquitto
+│       ↑ subscribes local Mosquitto drone/<id>/cmd_ack → publishes IoT Core
+│
+├── Mosquitto Broker (localhost:1883)
+│       ↓ drone/<id>/cmd
+│       ↑ drone/<id>/cmd_ack
+│
+└── px4_agent.py (companion)
+        ↓ MAVLink udp:127.0.0.1:14550
+        PX4
+```
+
+---
+
+## Design Philosophy
+
+This system is built around four roles, not four services. AWS supplies parts that happen to fit these roles. The roles themselves are technology-agnostic — you could rebuild this on Kafka, bare metal, or a different cloud entirely and the model would not change.
+
+```
+Command Producers   →   Command Bus   →   Command Processors   →   Dispatch Adapter
+  (create intent)       (store intent)      (reason about intent)    (speak to reality)
+```
+
+---
+
+### Role 1 — Command Producers
+
+**AWS mapping:** Lambda (stripped of power)
+
+A producer's only job is to create and submit a command. Nothing else.
+
+**What a producer does:**
+- Builds a command object (`cmd_id`, `cmd`, `params`, `drone_id`)
+- Validates the command schema
+- Puts it on the bus (SQS)
+
+**What a producer does NOT do:**
+- It does not know MQTT exists
+- It does not care if the drone is online
+- It does not retry execution
+- It does not track whether the command was delivered
+
+**Examples of producers in this system:**
+
+| Producer | Trigger |
+|---|---|
+| Scheduled Lambda | EventBridge rule (e.g. periodic status command) |
+| Safety watchdog Lambda | Alarm state change (e.g. geofence breach → RTL) |
+| State machine step | Step Functions workflow |
+| Future command Lambda | Direct invocation (when needed) |
+
+**The hard constraint:**
+
+> A producer Lambda must be deletable without breaking the system.
+
+If removing a producer breaks dispatch, responsibility has leaked out of the producer and into something downstream. That means the boundary is wrong and needs to be fixed.
+
+---
+
+### Role 2 — Command Bus
+
+**AWS mapping:** SQS FIFO
+
+The command bus is the spine of the system. It is the single source of truth for what commands exist and in what order they should be processed.
+
+**Configuration:**
+- One primary command queue
+- `MessageGroupId = drone_id` — preserves per-drone ordering
+- `MessageDeduplicationId = cmd_id` — prevents duplicate execution
+
+**What the bus is allowed to do:**
+- Store commands durably
+- Delay delivery
+- Retry delivery on failure
+- Preserve order within a group
+
+**What the bus is NOT allowed to do:**
+- Interpret what a command means
+- Filter commands based on content
+- Mutate a command in any way
+
+**The durability constraint:**
+
+> If SQS goes down, correctness pauses — it does not corrupt.
+
+"Durable" does not mean "always available." It means that when the bus recovers, the system resumes from exactly where it left off. No commands are lost, no commands are doubled, no order is violated. That is what durability actually guarantees.
+
+---
+
+### Role 3 — Command Processors
+
+**AWS mapping:** Lambda + secondary SQS queues (+ optional EventBridge for fan-out)
+
+Processors sit between the raw command bus and the final dispatch queue. Each processor reads from one queue and writes to another. They reason about commands — they may reject them, enrich them, or route them — but they never reinterpret what a command means or talk to devices.
+
+**The pattern:**
+```
+Queue A  →  Processor Lambda  →  Queue B
+                   ↓
+             Dead-letter queue (rejected commands)
+```
+
+**Typical processors:**
+
+| Processor | Responsibility |
+|---|---|
+| Validator | Schema checks, safety constraint checks |
+| Enricher | Adds derived metadata (e.g. current drone state, mission context) |
+| Router | Expands one command into N targets (e.g. fleet broadcast) |
+| Rate limiter | Delays or drops commands exceeding a threshold |
+| Simulator | Shadow execution for testing without touching real hardware |
+
+**The design rule:**
+
+> Processors may reject or annotate commands, but never reinterpret intent.
+
+A validator that rejects a malformed command is correct. A processor that changes what `RTL` means based on some internal logic has broken the abstraction. The meaning of a command is fixed when it is created by the producer. Processors are allowed to gate it, not redefine it.
+
+**The failure mode to watch for:**
+
+If you ever find yourself thinking "I'll just publish to MQTT here real quick from this processor" — stop. That is how the abstraction dies. Once a processor speaks protocol, it becomes a dispatcher, and you lose the ability to test, replace, or reason about the two separately.
+
+---
+
+### Role 4 — Dispatch Adapter
+
+**AWS mapping:** Lambda (lightweight) or ECS/Fargate (if long-lived MQTT sessions matter)
+
+The dispatch adapter is the only component in the entire system that knows MQTT exists. Everything above it is protocol-agnostic.
+
+**What it does:**
+- Pulls commands from the final dispatch queue
+- Translates intent into device protocol (MQTT message to `drone/<id>/cmd`)
+- Publishes to the MQTT broker with appropriate QoS
+- Handles QoS retries at the transport layer
+
+**What it does NOT do:**
+- No branching logic based on command content
+- No safety decisions
+- No policy enforcement
+- No writes back to the command bus
+
+**The determinism constraint:**
+
+> Given the same command, the dispatcher's output must be identical every time.
+
+If the dispatcher behaves differently for the same input, the bug is in the dispatcher. If you need conditional behavior, that logic belongs in a processor upstream, not here.
+
+**Why ECS instead of Lambda for dispatch (when relevant):**
+MQTT is a stateful protocol — persistent sessions, QoS 1/2 state, and subscription state all live in the connection. A Lambda that tears down after each invocation loses that state. If persistent session management matters (it will in later phases), the dispatcher should be a long-lived ECS task rather than a stateless Lambda.
+
+---
+
+### IAM as a Physical Enforcement Layer
+
+These role boundaries are not just architectural conventions. They are enforced by IAM policy so that a component literally cannot cross its boundary, even if the code tries to.
+
+| Role | Allowed IAM actions |
+|---|---|
+| Producer | `sqs:SendMessage` on the command queue only |
+| Processor | `sqs:ReceiveMessage` + `sqs:SendMessage` on its queues only |
+| Dispatcher | `sqs:ReceiveMessage` on dispatch queue + `iot:Publish` only |
+
+If a processor Lambda does not have `iot:Publish` in its policy, it cannot publish to MQTT even by accident. The architecture is physically enforced, not just documented.
+
+---
+
+### Commands and Events Are Separate Pipelines
+
+Commands ask for the future. Events report the past. They must never share a pipeline.
+
+```
+Commands:   Producer → Bus → Processor → Dispatcher → Device
+Events:     Device → MQTT → IoT Rule → Event pipeline → Observers
+```
+
+ACKs and telemetry from the drone are events. They flow into a separate event pipeline (IoT Rule → Lambda → DynamoDB). They do not flow back into the command queue. Events may trigger new commands — a watchdog Lambda reading a telemetry alarm and producing a new RTL command is correct. But an event directly mutating or requeuing an existing command breaks causality and makes the system impossible to reason about.
+
+---
+
+
+
+---
+
+## Components
+
+### PX4 Companion Agent
+
+**File:** `px4_agent.py`
+Runs on the companion machine as a systemd service inside a Python virtualenv.
+
+**MQTT topics:**
+
+| Direction | Topic |
+|---|---|
+| Subscribe | `drone/<drone_id>/cmd` |
+| Publish | `drone/<drone_id>/cmd_ack` |
+
+**On receiving a command (`{ cmd_id, cmd, params, drone_id }`):**
+
+1. Parse JSON
+2. Persist to SQLite with status `RECEIVED`
+3. Publish ACK on `drone/<id>/cmd_ack`
+4. Convert to MAVLink — safe high-level commands only: `RTL`, `LOITER`, `SET_MODE`
+5. Send MAVLink to PX4 via `udp:127.0.0.1:14550`
+6. Wait for `COMMAND_ACK` from PX4
+7. Publish `EXECUTED` result on `drone/<id>/cmd_ack`
+8. Update SQLite status to `EXECUTED`
+
+**Connectivity:**
+- MQTT broker: `localhost:1883`
+- MAVLink endpoint: `udp:127.0.0.1:14550` (PX4 SITL default)
+
+**Notes:**
+- Heartbeat warnings are expected until heartbeat is implemented
+- SQLite acts as a local audit log for all commands received
+
+---
+
+### Local Mosquitto Broker
+
+Runs on the companion machine (or C2 VM). This is the edge relay — not the public entrypoint.
+
+**Topics in use:**
+
+| Topic | Role |
+|---|---|
+| `drone/<id>/cmd` | Commands delivered from forwarder to agent |
+| `drone/<id>/cmd_ack` | ACKs published by agent, picked up by forwarder |
+| `drone/<id>/telemetry_enc` | Telemetry (separate pipeline) |
+
+---
+
+### IoT Forwarder
+
+Runs on EC2. Bridges AWS IoT Core and the local Mosquitto broker. The existing forwarder (telemetry pipeline) is extended with reverse flow for commands.
+
+**Subscriptions:**
+
+| From | Topic | Action |
+|---|---|---|
+| IoT Core | `drone/<drone_id>/cmd` | Publish to local Mosquitto |
+| Local Mosquitto | `drone/<drone_id>/cmd_ack` | Publish to IoT Core |
+
+**Other responsibilities (carried over):**
+- Holds IoT credentials and config
+- Signs and forwards telemetry
+- Publishes structured CloudWatch logs and metrics
+
+---
+
+### AWS IoT Core
+
+The cloud MQTT broker. Treated as external reality — not part of the command bus.
+
+**Topics:**
+
+| Topic | Direction |
+|---|---|
+| `drone/<id>/cmd` | Cloud → Forwarder → Agent |
+| `drone/<id>/cmd_ack` | Agent → Forwarder → Cloud |
+| `drone/<id>/telemetry_enc` | Agent → Cloud (telemetry pipeline) |
+
+**IoT Rule:**
+
+- Pattern: `drone/+/cmd_ack`
+- Action: invoke `ack_processor` Lambda
+
+Command topics do not need a rule unless you want auditing. Commands enter IoT Core via Worker Lambda publish.
+
+---
+
+### Cloud Command Pipeline
+
+#### Command Producer Lambda
+
+Responsibilities:
+- Build a command object (`cmd_id`, `cmd`, `params`, `drone_id`)
+- Validate command schema and params
+- Write row to DynamoDB `Commands` table with status `CREATED`
+- Push message to SQS FIFO
+  - `MessageGroupId = drone_id`
+  - `MessageDeduplicationId = cmd_id`
+
+A producer Lambda must be deletable without breaking the system. If deleting it breaks dispatch, responsibility has leaked.
+
+#### Worker Lambda (SQS → IoT)
+
+Responsibilities:
+- Consume SQS FIFO messages in order per drone
+- Publish command JSON to IoT Core topic `drone/<id>/cmd` with QoS 1
+- Update DynamoDB row: `status = PUBLISHED_TO_IOT`
+
+#### ack_processor Lambda
+
+Triggered by IoT Rule on `drone/+/cmd_ack`.
+
+Responsibilities:
+- Parse ACK or EXECUTED payload from agent
+- Update DynamoDB row:
+  - `status = ACK` or `EXECUTED`
+  - Store `exec_result`, timestamps, error codes
+
+---
+
+### DynamoDB Commands Table
+
+| Attribute | Type | Description |
+|---|---|---|
+| `cmd_id` (PK) | String | Globally unique command ID (UUID) |
+| `drone_id` | String | Target drone |
+| `cmd` | String | `RTL`, `LOITER`, `SET_MODE`, … |
+| `params` | Map | Optional parameters (altitude, mode, etc.) |
+| `status` | String | `CREATED` → `PUBLISHED_TO_IOT` → `ACK` → `EXECUTED` |
+| `created_at` | String | ISO timestamp |
+| `updated_at` | String | Updated on every state transition |
+| `exec_result` | Map | MAVLink result, error codes, PX4 response |
+
+---
+
+## Command Lifecycle
+
+```
+CREATED
+   │
+   │  Producer Lambda writes row + pushes SQS
+   ▼
+PUBLISHED_TO_IOT
+   │
+   │  Worker Lambda publishes to IoT Core
+   │  Forwarder delivers to local broker
+   │  Agent receives
+   ▼
+ACK
+   │
+   │  Agent persists + sends MAVLink to PX4
+   │  Agent publishes ACK on cmd_ack
+   ▼
+EXECUTED
+      Agent receives COMMAND_ACK from PX4
+      Agent publishes EXECUTED on cmd_ack
+      ack_processor Lambda updates DynamoDB
+```
+
+Every transition is written to DynamoDB. The system is ordered (SQS FIFO per drone), durable (SQS + DynamoDB), and idempotent (`cmd_id` deduplication).
+
+---
+
+## Implementation Status
+
+| Component | Status |
+|---|---|
+| `px4_agent.py` running as systemd service | ✅ Done |
+| Companion Mosquitto broker | ✅ Done |
+| Agent ↔ broker (cmd / cmd_ack) | ✅ Done |
+| Agent SQLite persistence | ✅ Done |
+| Agent dependency venv | ✅ Done |
+| PX4 MAVLink command execution | 🔄 Pending SITL end-to-end test |
+| Agent heartbeat | 🔄 Not yet implemented |
+| Forwarder reverse flow (cmd delivery + cmd_ack relay) | 🔄 Pending extension |
+| DynamoDB Commands table | 🔄 Not yet built |
+| SQS FIFO queue | 🔄 Not yet built |
+| Producer Lambda | 🔄 Not yet built |
+| Worker Lambda | 🔄 Not yet built |
+| ack_processor Lambda + IoT Rule | 🔄 Not yet built |
+
+---
+
+## What's Next
+
+Recommended build order:
+
+1. End-to-end test of PX4 MAVLink commands (`RTL` / `LOITER` / `SET_MODE`) via agent
+2. Implement agent heartbeat so the system treats the cloud link as alive/dead
+3. Extend forwarder for reverse flow (cmd delivery + cmd_ack relay to IoT Core)
+4. Deploy DynamoDB `Commands` table
+5. Build SQS FIFO queue + Worker Lambda
+6. Build Producer Lambda
+7. Build `ack_processor` Lambda + IoT Rule
+8. Add failsafe logic (RTL on link loss, geofence, watchdog Lambda)
+9. Add cloud monitoring (ACK timeout alarms, no-telemetry alarms, CloudWatch C2 dashboard)
