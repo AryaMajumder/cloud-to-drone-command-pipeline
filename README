@@ -393,6 +393,18 @@ EXECUTED
 Every transition is written to DynamoDB. The system is ordered (SQS FIFO per drone), durable (SQS + DynamoDB), and idempotent (`cmd_id` deduplication).
 
 ---
+##Multi-Drone Validation
+The pipeline is designed to be horizontally scalable by architecture — adding a drone requires no code changes, only configuration.
+Validated with two simultaneous PX4 SITL instances:
+
+Each drone runs an independent px4_agent.py daemon with its own SQLite database
+Both agents connect to the same Mosquitto broker using different drone_id values
+Commands route through the same cloud pipeline — isolated per drone via MessageGroupId=drone_id in SQS FIFO
+RTL sent to drone-01 executes only on drone-01 — drone-02 is unaffected
+Killing drone-01 agent has zero impact on drone-02 operation
+DynamoDB tracks state independently per cmd_id + drone_id — no state mixing
+
+The shared infrastructure handles N drones. The isolation is enforced by the architecture.
 
 ## Implementation Status
 
